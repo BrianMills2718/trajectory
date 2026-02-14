@@ -1,0 +1,37 @@
+# Trajectory Tracker Configuration
+
+db_path: data/trajectory.db
+
+# Default directory to scan for projects
+projects_dir: /home/brian/projects
+
+# Claude Code logs location
+claude_logs_dir: ~/.claude/projects
+
+# LLM settings (Phase 2)
+llm:
+  model: gemini/gemini-2.0-flash  # bulk/fast work
+  quality_model: anthropic/claude-sonnet-4-20250514  # quality work
+  batch_size: 30  # events per LLM call
+  max_cost_per_run: 1.00  # USD budget per analysis run
+
+# Extraction settings
+extraction:
+  # File patterns to treat as docs
+  doc_patterns:
+    - "CLAUDE.md"
+    - "STATUS.md"
+    - "README.md"
+    - "ROADMAP.md"
+  # Archive directory patterns
+  archive_patterns:
+    - "docs/archive"
+    - "archive"
+  # Max file size to read (bytes)
+  max_file_size: 500000  # 500KB
+
+# Digest settings (Phase 3)
+digest:
+  significance_threshold: 0.5
+  daily_max_events: 50
+  weekly_max_events: 200

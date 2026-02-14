@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "trajectory"
+version = "0.1.0"
+description = "Project trajectory tracker - idea lineage across git repos, Claude logs, and docs"
+requires-python = ">=3.11"
+dependencies = [
+    "pydriller>=2.6",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.8",
+]
+analysis = [
+    "jinja2>=3.1",
+]
+mcp = [
+    "fastmcp>=0.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
