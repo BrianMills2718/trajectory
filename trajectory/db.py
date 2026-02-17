@@ -6,7 +6,14 @@ import sqlite3
 from pathlib import Path
 
 from trajectory.config import Config
-from trajectory.models import EventInsert, EventRow, ExtractedEvent, ProjectRow
+from trajectory.models import (
+    ConceptRow,
+    DecisionRow,
+    EventInsert,
+    EventRow,
+    ExtractedEvent,
+    ProjectRow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +463,220 @@ class TrajectoryDB:
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (event_id, project_id, title, reasoning, alternatives, decision_type, analysis_run_id),
         )
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    # --- Query operations ---
+
+    def get_project_by_name(self, name: str) -> ProjectRow | None:
+        """Case-insensitive project lookup by name."""
+        row = self.conn.execute(
+            "SELECT * FROM projects WHERE LOWER(name) = LOWER(?)", (name,)
+        ).fetchone()
+        if row:
+            return ProjectRow(**dict(row))
+        return None
+
+    def get_concept_by_name(self, name: str) -> ConceptRow | None:
+        """Case-insensitive concept lookup by name."""
+        row = self.conn.execute(
+            "SELECT * FROM concepts WHERE LOWER(name) = LOWER(?)", (name,)
+        ).fetchone()
+        if row:
+            return ConceptRow(**dict(row))
+        return None
+
+    def list_concepts(
+        self,
+        status: str | None = None,
+        project_id: int | None = None,
+    ) -> list[ConceptRow]:
+        """List concepts with optional filters."""
+        if project_id is not None:
+            # Join through concept_events → events to find concepts for a project
+            clauses = ["e.project_id = ?"]
+            params: list[str | int] = [project_id]
+            if status is not None:
+                clauses.append("c.status = ?")
+                params.append(status)
+            rows = self.conn.execute(
+                f"""SELECT DISTINCT c.* FROM concepts c
+                    JOIN concept_events ce ON c.id = ce.concept_id
+                    JOIN events e ON ce.event_id = e.id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY c.name""",
+                params,
+            ).fetchall()
+        else:
+            if status is not None:
+                rows = self.conn.execute(
+                    "SELECT * FROM concepts WHERE status = ? ORDER BY name",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM concepts ORDER BY name"
+                ).fetchall()
+        return [ConceptRow(**dict(r)) for r in rows]
+
+    def search_concepts(self, keywords: list[str]) -> list[ConceptRow]:
+        """Search concepts by LIKE matching on names."""
+        if not keywords:
+            return []
+        clauses = ["LOWER(name) LIKE ?"] * len(keywords)
+        params = [f"%{kw.lower()}%" for kw in keywords]
+        rows = self.conn.execute(
+            f"SELECT * FROM concepts WHERE {' OR '.join(clauses)} ORDER BY name",
+            params,
+        ).fetchall()
+        return [ConceptRow(**dict(r)) for r in rows]
+
+    def get_concept_events(
+        self, concept_id: int, limit: int = 50
+    ) -> list[dict[str, object]]:
+        """Get events linked to a concept with relationship metadata."""
+        rows = self.conn.execute(
+            """SELECT ce.relationship, ce.confidence, ce.reasoning AS ce_reasoning,
+                      e.*
+               FROM concept_events ce
+               JOIN events e ON ce.event_id = e.id
+               WHERE ce.concept_id = ?
+               ORDER BY e.timestamp DESC
+               LIMIT ?""",
+            (concept_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_events_for_concepts(
+        self, concept_ids: list[int], limit: int = 100
+    ) -> list[dict[str, object]]:
+        """Get events for multiple concepts, including concept name."""
+        if not concept_ids:
+            return []
+        placeholders = ",".join("?" * len(concept_ids))
+        rows = self.conn.execute(
+            f"""SELECT c.name AS concept_name, ce.relationship, ce.confidence,
+                       e.*
+                FROM concept_events ce
+                JOIN events e ON ce.event_id = e.id
+                JOIN concepts c ON ce.concept_id = c.id
+                WHERE ce.concept_id IN ({placeholders})
+                ORDER BY e.timestamp DESC
+                LIMIT ?""",
+            [*concept_ids, limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_timeline(
+        self,
+        project_id: int,
+        since: str | None = None,
+        until: str | None = None,
+        min_significance: float | None = None,
+        limit: int = 200,
+    ) -> list[EventRow]:
+        """Get chronological events for a project with optional filters."""
+        clauses = ["project_id = ?"]
+        params: list[str | int | float] = [project_id]
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(since)
+        if until is not None:
+            clauses.append("timestamp <= ?")
+            params.append(until)
+        if min_significance is not None:
+            clauses.append("significance >= ?")
+            params.append(min_significance)
+        rows = self.conn.execute(
+            f"SELECT * FROM events WHERE {' AND '.join(clauses)} ORDER BY timestamp ASC LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+        return [EventRow(**dict(r)) for r in rows]
+
+    def get_decisions(
+        self, project_id: int | None = None, limit: int = 50
+    ) -> list[DecisionRow]:
+        """Get decisions, optionally filtered by project."""
+        if project_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM decisions WHERE project_id = ? ORDER BY created_at DESC LIMIT ?",
+                (project_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM decisions ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [DecisionRow(**dict(r)) for r in rows]
+
+    # --- Correction operations ---
+
+    def rename_concept(self, concept_id: int, new_name: str) -> None:
+        """Rename a concept. Raises ValueError if new name already exists."""
+        existing = self.conn.execute(
+            "SELECT id FROM concepts WHERE LOWER(name) = LOWER(?) AND id != ?",
+            (new_name, concept_id),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"Concept name '{new_name}' already exists")
+        self.conn.execute(
+            "UPDATE concepts SET name = ?, updated_at = datetime('now') WHERE id = ?",
+            (new_name, concept_id),
+        )
+        self.conn.commit()
+
+    def merge_concepts(self, source_id: int, target_id: int) -> int:
+        """Merge source concept into target. Returns count of events moved."""
+        # Move concept_events from source to target, skip duplicates
+        rows = self.conn.execute(
+            "SELECT event_id FROM concept_events WHERE concept_id = ?",
+            (source_id,),
+        ).fetchall()
+        moved = 0
+        for row in rows:
+            try:
+                self.conn.execute(
+                    "UPDATE concept_events SET concept_id = ? WHERE concept_id = ? AND event_id = ?",
+                    (target_id, source_id, row["event_id"]),
+                )
+                moved += 1
+            except sqlite3.IntegrityError:
+                # Target already has this event — delete the source link
+                self.conn.execute(
+                    "DELETE FROM concept_events WHERE concept_id = ? AND event_id = ?",
+                    (source_id, row["event_id"]),
+                )
+        # Mark source as merged
+        self.conn.execute(
+            "UPDATE concepts SET status = 'merged', merged_into_id = ?, updated_at = datetime('now') WHERE id = ?",
+            (target_id, source_id),
+        )
+        self.conn.commit()
+        return moved
+
+    def update_concept_status(self, concept_id: int, status: str) -> None:
+        """Update concept lifecycle status."""
+        self.conn.execute(
+            "UPDATE concepts SET status = ?, updated_at = datetime('now') WHERE id = ?",
+            (status, concept_id),
+        )
+        self.conn.commit()
+
+    def insert_correction(
+        self,
+        correction_type: str,
+        target_type: str,
+        target_id: int,
+        old_value: str | None = None,
+        new_value: str | None = None,
+        source_command: str | None = None,
+    ) -> int:
+        """Insert a correction audit record. Returns correction ID."""
+        cursor = self.conn.execute(
+            """INSERT INTO corrections (correction_type, target_type, target_id, old_value, new_value, source_command)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (correction_type, target_type, target_id, old_value, new_value, source_command),
+        )
+        self.conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
     # --- Helpers ---

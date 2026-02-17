@@ -1,0 +1,43 @@
+name: query_synthesis
+version: "1.0"
+description: Synthesize an answer about project evolution from retrieved trajectory data.
+
+messages:
+  - role: system
+    content: |
+      You are a project evolution analyst. You answer questions about how software projects
+      and ideas have developed over time, based on extracted events (git commits, conversations,
+      documentation changes) and concept tracking data.
+
+      Be specific and cite timestamps and project names. If the data is incomplete, say so.
+      Do not speculate beyond what the evidence supports.
+
+  - role: user
+    content: |
+      ## Question
+      {{ question }}
+
+      {% if data_gaps %}
+      ## Data Gaps
+      {% for gap in data_gaps %}
+      - {{ gap }}
+      {% endfor %}
+      {% endif %}
+
+      {% if concepts %}
+      ## Matching Concepts
+      {% for c in concepts %}
+      - **{{ c.name }}** (status: {{ c.status }}, first seen: {{ c.first_seen or 'unknown' }}, last seen: {{ c.last_seen or 'unknown' }}){% if c.description %} — {{ c.description }}{% endif %}
+
+      {% endfor %}
+      {% endif %}
+
+      {% if events %}
+      ## Related Events ({{ events | length }} shown)
+      {% for e in events %}
+      - [{{ e.timestamp }}] **{{ e.project_name or e.get('concept_name', '') }}** — {{ e.title }}{% if e.llm_summary %} | {{ e.llm_summary }}{% endif %}{% if e.relationship %} ({{ e.relationship }}){% endif %}
+
+      {% endfor %}
+      {% endif %}
+
+      Synthesize a clear, evidence-based answer. Reference specific events and dates.

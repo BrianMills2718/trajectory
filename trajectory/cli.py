@@ -33,6 +33,11 @@ def main() -> None:
         help="Path to the project to analyze",
     )
 
+    # query command
+    query_parser = sub.add_parser("query", help="Ask about project evolution")
+    query_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    query_parser.add_argument("question", help="Natural language question")
+
     # stats command
     stats_parser = sub.add_parser("stats", help="Show ingestion stats")
     stats_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
@@ -75,6 +80,15 @@ def main() -> None:
                 print(f"\nConcepts ({len(rows)}):")
                 for r in rows:
                     print(f"  {r['name']} (first: {r['first_seen'][:10] if r['first_seen'] else '?'}, last: {r['last_seen'][:10] if r['last_seen'] else '?'})")
+
+        elif args.command == "query":
+            from trajectory.output.query_engine import query_trajectory
+            result = query_trajectory(args.question, db, config)
+            print(result.answer)
+            if result.data_gaps:
+                print("\nData gaps:")
+                for gap in result.data_gaps:
+                    print(f"  - {gap}")
 
         elif args.command == "stats":
             projects = db.list_projects()

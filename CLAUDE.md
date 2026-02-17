@@ -4,19 +4,19 @@
 
 Project trajectory tracker — tracks how ideas emerge, evolve, and spread across Brian's 60+ projects. Ingests git commits, Claude Code conversation logs, and documentation into SQLite, then uses LLM analysis to extract concepts, significance scores, decisions, and intent from each event. Exposed as an MCP server for both Claude Code and OpenClaw/moltbot.
 
-## Current State (2026-02-14)
+## Current State (2026-02-17)
 
-### What's Built and Working (Phase 1 + Phase 2)
+### What's Built and Working (Phase 1 + Phase 2 + Phase 3)
 
 **Phase 1: Extractors + SQLite** — COMPLETE
 - `trajectory/config.py` + `config.yaml` — Pydantic config loaded from YAML
-- `trajectory/models.py` — All Pydantic models (EventType, Intent, ConceptStatus, ExtractedEvent, etc.)
-- `trajectory/db.py` — SQLite with WAL mode, full schema (9 tables), all CRUD operations including analysis methods
+- `trajectory/models.py` — All Pydantic models (EventType, Intent, ConceptStatus, QueryResult, etc.)
+- `trajectory/db.py` — SQLite with WAL mode, full schema (9 tables), all CRUD + query + correction operations
 - `trajectory/extractors/git_extractor.py` — PyDriller-based commit extraction
 - `trajectory/extractors/claude_log_extractor.py` — JSONL parser for Claude Code logs with smart log dir matching (handles path aliases)
 - `trajectory/extractors/doc_extractor.py` — Extracts from CLAUDE.md, STATUS.md, archive dirs, docs/archive dirs
 - `trajectory/ingest.py` — Orchestrator that runs all 3 extractors with dedup by source_id
-- `trajectory/cli.py` — CLI with `ingest`, `analyze`, `stats` commands
+- `trajectory/cli.py` — CLI with `ingest`, `analyze`, `stats`, `query` commands
 
 **Phase 2: LLM Analysis** — COMPLETE
 - `trajectory/analysis/event_classifier.py` — Batches events (30 at a time), sends to LLM via `call_llm_structured()`, extracts intent, summary, concepts, significance (0.0-1.0), and decisions
@@ -25,28 +25,33 @@ Project trajectory tracker — tracks how ideas emerge, evolve, and spread acros
 - Cost budget enforcement (stops if exceeds `max_cost_per_run`)
 - Results stored: events updated with llm_summary/llm_intent/significance, concepts table populated, concept_events linked, decisions stored
 
+**Phase 3: Query Engine + MCP Server** — COMPLETE
+- `trajectory/output/query_engine.py` — 7 functions: NL question → SQL retrieval → LLM synthesis, timelines, concept history, project listing, concept listing, concept corrections, project ingestion
+- `trajectory/mcp_server.py` — 7 MCP tools wrapping query engine (query_trajectory, get_timeline, get_concept_history, list_tracked_projects, list_concepts, ingest_project, correct_concept)
+- `prompts/query_synthesis.yaml` — Jinja2 template for NL synthesis via `llm_client.render_prompt()`
+- MCP server wired into both Claude Code (`~/.config/claude-cli-nodejs/mcp.json`) and Codex CLI (`~/.codex/config.toml`)
+- Keyword-based concept search (SQL LIKE on ~100 concepts — fast, no vector DB needed)
+- Explicit data gaps in QueryResult (reports unanalyzed event counts, missing concepts)
+- Concept corrections with audit trail: rename, merge, status change → `corrections` table
+
 **Tested on sam_gov:**
 - 595 commits + 1 conversation + 68 docs = 664 events ingested
 - All 664 events analyzed by LLM
 - Concepts, decisions, significance scores all stored in SQLite
 
+**Test Suite: 46 tests passing**
+- `tests/test_db.py` — 26 tests for DB query and correction methods
+- `tests/test_query_engine.py` — 16 tests for query engine functions (LLM calls mocked)
+- `tests/test_mcp_server.py` — 4 tests for tool registration and JSON returns
+
 ### What's NOT Built Yet
 
-**Phase 3: MCP Server + Queries + Digests + Corrections**
-- `trajectory/mcp_server.py` — 9 MCP tools (query_trajectory, get_timeline, get_concept_history, generate_narrative, generate_digest, ingest_project, list_tracked_projects, list_concepts, correct_concept)
-- `trajectory/output/query_engine.py` — NL question → SQL retrieval → LLM synthesis
-- Digest generation for daily/weekly summaries
-- User corrections via NL commands
-- MCP config for Claude Code and OpenClaw
+**Phase 3 Remaining:**
+- Digest generation for daily/weekly summaries (deferred)
 
 **Phase 4: Visualization + Narrative Export**
 - `trajectory/output/html_timeline.py` — D3.js interactive timeline
 - `trajectory/output/markdown_exporter.py` — Narrative markdown reports
-
-### Not Yet Done (Housekeeping)
-- No entry in `/home/brian/projects/PROJECT_GRAPH.json` yet
-- No initial git commit yet
-- No tests written yet
 
 ## Architecture
 
@@ -59,7 +64,8 @@ trajectory/
 │   ├── models.py                  # All Pydantic models
 │   ├── db.py                      # TrajectoryDB class — SQLite wrapper with all operations
 │   ├── ingest.py                  # Orchestrator: runs extractors, dedup, stores events
-│   ├── cli.py                     # CLI: ingest, analyze, stats
+│   ├── cli.py                     # CLI: ingest, analyze, stats, query
+│   ├── mcp_server.py              # MCP server — 7 tools
 │   ├── extractors/
 │   │   ├── base.py                # BaseExtractor ABC
 │   │   ├── git_extractor.py       # PyDriller commit extraction
@@ -68,12 +74,18 @@ trajectory/
 │   ├── analysis/
 │   │   ├── __init__.py            # Adds llm_client to sys.path
 │   │   └── event_classifier.py    # LLM batch classification
-│   └── output/                    # Empty — Phase 3+4
+│   └── output/
+│       └── query_engine.py        # NL query → SQL → LLM synthesis
 ├── data/
 │   └── trajectory.db              # SQLite database (gitignored)
-├── prompts/                       # Empty — for Jinja2 templates later
+├── prompts/
+│   └── query_synthesis.yaml       # Jinja2 template for query synthesis
 ├── templates/                     # Empty — for D3.js HTML later
-└── tests/                         # Empty — no tests yet
+└── tests/
+    ├── conftest.py                # Shared fixtures (tmp_db, populated_db)
+    ├── test_db.py                 # 26 DB method tests
+    ├── test_query_engine.py       # 16 query engine tests
+    └── test_mcp_server.py         # 4 MCP server tests
 ```
 
 ## Database Schema (9 tables)
@@ -90,12 +102,14 @@ trajectory/
 
 ## Key Design Decisions
 
-- **llm_client**: Uses `/home/brian/projects/llm_client` (added to sys.path in analysis/__init__.py). Default model: gemini-flash for bulk work.
+- **llm_client**: Uses `/home/brian/projects/llm_client` (pip installed in .venv). Default model: gemini-flash for bulk work, quality_model (claude-sonnet) for synthesis.
 - **Dedup**: Events deduplicated by `source_id` (UNIQUE constraint). Format: `git:{hash}`, `claude:{session_id}`, `doc:{project}/{path}`
 - **Claude log key matching**: Claude Code log dirs use hyphenated paths (`-home-brian-sam-gov`). The extractor tries exact key match first, then falls back to suffix matching for path aliases.
 - **Incremental processing**: Tracks `last_ingested` per project. Extractors accept `since` parameter. Re-runs only process new events.
 - **Batch analysis**: 30 events per LLM call. Cost budget per run (default $1.00). Provenance tracked per analysis run.
 - **Flattened Pydantic models**: Gemini has a nesting depth limit for structured output. The classifier uses `FlatEventAnalysis` with `concepts_json`/`decisions_json` as JSON strings, then `_unflatten_analysis()` converts back to rich typed models after the LLM call.
+- **Keyword search, not embeddings**: `search_concepts` uses SQL LIKE on ~100 concepts. Fast, debuggable, no vector DB.
+- **Absolute prompt path**: Query engine uses `Path(__file__).parent.parent / "prompts"` to avoid cwd sensitivity.
 
 ## How to Run
 
@@ -112,33 +126,37 @@ python -m trajectory.cli ingest
 # Run LLM analysis on ingested events
 python -m trajectory.cli analyze /home/brian/projects/sam_gov
 
+# Ask about project evolution (NL query → LLM synthesis)
+python -m trajectory.cli query "How has the ontology idea evolved?"
+
 # Show stats
 python -m trajectory.cli stats
 
-# Query the DB directly
-python3 -c "
-import sqlite3
-db = sqlite3.connect('data/trajectory.db')
-db.row_factory = sqlite3.Row
-for r in db.execute('SELECT name FROM concepts ORDER BY name'):
-    print(r['name'])
-"
+# Run tests
+python -m pytest tests/ -v
 ```
+
+## MCP Server
+
+7 tools available via both Claude Code and Codex CLI:
+
+| Tool | Purpose |
+|------|---------|
+| `query_trajectory` | NL question → concept search → event retrieval → LLM synthesis |
+| `get_timeline` | Chronological events for a project with date/significance filters |
+| `get_concept_history` | Full history of a concept across all projects |
+| `list_tracked_projects` | All projects with event counts and analysis status |
+| `list_concepts` | Concepts with optional status/project filters |
+| `ingest_project` | Ingest events from a project directory |
+| `correct_concept` | Rename, merge, or change status of a concept |
 
 ## Venv Dependencies
 
 ```bash
-pip install pydriller pydantic pyyaml python-dotenv litellm instructor
+pip install pydriller pydantic pyyaml python-dotenv litellm instructor jinja2
+pip install -e ~/projects/llm_client
+pip install "mcp>=1.0"
 ```
-
-## What To Build Next (Phase 3)
-
-Priority order:
-1. `trajectory/output/query_engine.py` — NL query → SQL → LLM synthesis (this is the core user-facing feature)
-2. `trajectory/mcp_server.py` — Thin MCP adapter exposing 9 tools
-3. Wire MCP server into Claude Code config (`.mcp.json`)
-4. Digest generation
-5. Concept corrections
 
 ## Full Plan
 

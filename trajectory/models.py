@@ -133,6 +133,51 @@ class EventInsert(BaseModel):
 # --- Extractor output models ---
 
 
+class ConceptEventRow(BaseModel):
+    id: int
+    concept_id: int
+    event_id: int
+    relationship: str
+    confidence: float
+    reasoning: str | None = None
+    analysis_run_id: int | None = None
+
+
+class DecisionRow(BaseModel):
+    id: int
+    event_id: int | None = None
+    project_id: int
+    title: str
+    reasoning: str | None = None
+    alternatives: str | None = None
+    outcome: str | None = None
+    decision_type: str | None = None
+    analysis_run_id: int | None = None
+    created_at: str
+
+
+class CorrectionRow(BaseModel):
+    id: int
+    correction_type: str
+    target_type: str
+    target_id: int
+    old_value: str | None = None
+    new_value: str | None = None
+    source_command: str | None = None
+    created_at: str
+
+
+class QueryResult(BaseModel):
+    answer: str
+    concepts_found: list[str]
+    events_used: int
+    projects_involved: list[str]
+    data_gaps: list[str]
+
+
+# --- Insert models (what goes into the DB) ---
+
+
 class ExtractedEvent(BaseModel):
     """Raw event from an extractor, before DB insertion."""
     event_type: EventType
