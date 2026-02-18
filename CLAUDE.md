@@ -44,7 +44,31 @@ Project trajectory tracker — tracks how ideas emerge, evolve, and spread acros
 - `tests/test_query_engine.py` — 16 tests for query engine functions (LLM calls mocked)
 - `tests/test_mcp_server.py` — 4 tests for tool registration and JSON returns
 
+**Multi-Level Concept Extraction (2026-02-18):**
+- Concepts now carry a `level`: theme (project identity), design_bet (architectural choice), technique (implementation mechanism)
+- Open vocabulary — LLM can invent new levels with `level_rationale` explaining why
+- Prompt v3 (`event_classification_v3`) guides extraction with examples per level
+- `list_concepts` MCP tool + query engine accept `level` filter
+- DB migration adds `level` + `level_rationale` columns (idempotent)
+- First-extraction-wins: if a concept already has a level, later extractions don't overwrite
+- Verified on agent_ontology: 18 themes, 38 design_bets, 69 techniques (1 off-label "process" fixed)
+
+### Current Validation Plan (2026-02-18)
+
+Before cross-project concept linking, validate multi-level extraction across diverse project types:
+
+1. **Re-analyze sam_gov** (664 events, data/OSINT-heavy) — wipe analysis, re-run with v3
+2. **Re-analyze llm_client** (library project) — different shape, tests level generalization
+3. **Cross-project consistency check** — do shared concepts (knowledge_graph, mcp_server) get same level across projects?
+4. **Off-label review** — `SELECT name, level, level_rationale FROM concepts WHERE level NOT IN ('theme', 'design_bet', 'technique')` — evaluate whether open vocabulary produces signal or noise
+5. **Gate**: If themes are coherent across 3+ projects → proceed to cross-project concept linking
+
 ### What's NOT Built Yet
+
+**Next: Cross-project concept linking** (activate concept_links table)
+- Match themes across repos to show idea lineage (e.g., knowledge_graph spreading from one project to others)
+- Level filter makes this tractable: match on themes, ignore technique-level noise
+- Blocked on: multi-project level validation (above)
 
 **Phase 3 Remaining:**
 - Digest generation for daily/weekly summaries (deferred)
@@ -92,7 +116,7 @@ trajectory/
 
 - `projects` — tracked repos (name, path, git_remote, stats, last_ingested)
 - `events` — unified timeline (commit/conversation/doc_change/archive events with LLM analysis fields)
-- `concepts` — ideas/patterns that emerge and evolve (name, status, first_seen, last_seen)
+- `concepts` — ideas/patterns that emerge and evolve (name, level, level_rationale, status, first_seen, last_seen)
 - `concept_events` — links events to concepts with relationship type and confidence
 - `decisions` — architectural/design decisions extracted from events
 - `concept_links` — cross-concept relationships (depends_on, evolved_from, etc.)
@@ -146,7 +170,7 @@ python -m pytest tests/ -v
 | `get_timeline` | Chronological events for a project with date/significance filters |
 | `get_concept_history` | Full history of a concept across all projects |
 | `list_tracked_projects` | All projects with event counts and analysis status |
-| `list_concepts` | Concepts with optional status/project filters |
+| `list_concepts` | Concepts with optional status/project/level filters |
 | `ingest_project` | Ingest events from a project directory |
 | `correct_concept` | Rename, merge, or change status of a concept |
 
