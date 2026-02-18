@@ -25,6 +25,12 @@ class Intent(str, Enum):
     CLEANUP = "cleanup"
 
 
+class ConceptLevel(str, Enum):
+    THEME = "theme"
+    DESIGN_BET = "design_bet"
+    TECHNIQUE = "technique"
+
+
 class ConceptStatus(str, Enum):
     ACTIVE = "active"
     ABANDONED = "abandoned"
@@ -104,6 +110,7 @@ class ConceptRow(BaseModel):
     id: int
     name: str
     description: str | None = None
+    level: str | None = None
     first_seen: str | None = None
     last_seen: str | None = None
     status: ConceptStatus = ConceptStatus.ACTIVE

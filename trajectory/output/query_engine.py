@@ -239,6 +239,7 @@ def list_concepts(
     db: TrajectoryDB,
     status: str | None = None,
     project: str | None = None,
+    level: str | None = None,
 ) -> list[dict[str, object]]:
     """List concepts with optional filters and event counts."""
     project_id: int | None = None
@@ -248,7 +249,7 @@ def list_concepts(
             raise ValueError(f"Project not found: {project}")
         project_id = p.id
 
-    concepts = db.list_concepts(status=status, project_id=project_id)
+    concepts = db.list_concepts(status=status, project_id=project_id, level=level)
     result: list[dict[str, object]] = []
     for c in concepts:
         event_count = db.conn.execute(
@@ -257,6 +258,7 @@ def list_concepts(
         ).fetchone()
         result.append({
             "name": c.name,
+            "level": c.level,
             "status": c.status,
             "description": c.description,
             "first_seen": c.first_seen,

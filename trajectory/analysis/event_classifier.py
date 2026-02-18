@@ -13,14 +13,15 @@ from trajectory.models import EventRow
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "event_classification_v1"
+PROMPT_VERSION = "event_classification_v3"
 
 
 # --- Pydantic response models ---
 
 
 class ConceptMention(BaseModel):
-    name: str = Field(description="Short concept name, lowercase, underscore-separated (e.g. 'recursive_agent', 'evidence_architecture')")
+    name: str = Field(description="Concept name, lowercase_underscore. Reuse an existing name from the vocabulary when the idea is the same.")
+    level: str = Field(description="One of: theme (what the project is about), design_bet (architectural choice being pursued), technique (implementation mechanism)")
     relationship: str = Field(description="One of: introduces, develops, refactors, abandons, completes, references")
     confidence: float = Field(ge=0.0, le=1.0, description="How confident this concept is relevant")
 
@@ -47,9 +48,9 @@ class BatchAnalysisResult(BaseModel):
 # --- Classifier ---
 
 
-def _build_batch_prompt(events: list[EventRow]) -> str:
-    """Build a prompt for batch event classification."""
-    event_descriptions: list[str] = []
+def _format_events(events: list[EventRow]) -> str:
+    """Format events for the prompt."""
+    descriptions: list[str] = []
     for i, event in enumerate(events):
         parts = [
             f"[Event {i}]",
@@ -71,35 +72,65 @@ def _build_batch_prompt(events: list[EventRow]) -> str:
             except json.JSONDecodeError:
                 pass
         if event.body:
-            # Truncate body to avoid token explosion
             body = event.body[:1500]
             if len(event.body) > 1500:
                 body += "\n... [truncated]"
             parts.append(f"Body:\n{body}")
-        event_descriptions.append("\n".join(parts))
+        descriptions.append("\n".join(parts))
+    return "\n\n---\n\n".join(descriptions)
 
-    events_text = "\n\n---\n\n".join(event_descriptions)
 
-    return f"""Analyze each event from a software project's history. For each event, determine:
+def _build_batch_prompt(events: list[EventRow], existing_concepts: list[str]) -> str:
+    """Build a prompt for batch event classification."""
+    events_text = _format_events(events)
 
-1. **summary**: 1-2 sentence summary of what happened
-2. **intent**: The primary intent (feature, bugfix, refactor, exploration, documentation, test, infrastructure, cleanup)
-3. **significance**: How significant is this event? (0.0=routine/noise, 0.3=minor, 0.5=noteworthy, 0.7=important, 1.0=major milestone)
-4. **concepts**: Key technical concepts, patterns, or architectural ideas mentioned or affected. Use lowercase underscore-separated names. Each concept should have a relationship type (introduces/develops/refactors/abandons/completes/references).
-5. **decisions**: Any architectural or design decisions made (if any).
+    vocab_section = ""
+    if existing_concepts:
+        vocab_section = f"""
+## Existing concept vocabulary
 
-Guidelines for significance:
-- 0.0-0.2: Routine commits, typo fixes, dependency bumps, trivial changes
-- 0.3-0.4: Minor features, small bug fixes, test additions
-- 0.5-0.6: Notable features, significant refactors, important bug fixes
-- 0.7-0.8: Major features, architectural changes, critical bug fixes
-- 0.9-1.0: Project milestones, fundamental architecture changes, major releases
+These concepts have already been identified in this project. Reuse these names when an event
+relates to the same idea rather than inventing a synonym:
 
-Guidelines for concepts:
-- Be specific: "recursive_agent" not "agent"
-- Reuse concept names across events when they refer to the same thing
-- Common patterns: error_handling, mcp_server, evidence_architecture, clean_architecture, etc.
+{', '.join(existing_concepts)}
 
+You may introduce new concepts when an event genuinely brings a new idea not captured above.
+"""
+
+    return f"""You are helping build a cross-project timeline that tracks how ideas emerge, spread, and
+evolve across 60+ software projects over months. This data feeds three downstream uses:
+
+1. **Cross-project linking**: Concepts get matched across repositories to show how an idea (like
+   "mcp_server" or "knowledge_graph") spread from one project to others.
+2. **Timeline narrative**: Concepts cluster events into coherent storylines so someone can ask
+   "what happened with the ontology idea?" and get a meaningful arc, not a list of commits.
+3. **Query answering**: Users search for concepts by keyword to find relevant events.
+
+Think about it this way: if someone asked "what is this project about and where is it headed?",
+the concepts you extract should be the ideas you'd mention in your answer. They're the design bets,
+architectural choices, and recurring themes that define the project's identity and direction —
+not the implementation mechanisms used within individual commits. Many routine commits (dependency
+bumps, typo fixes, minor bug fixes) have no concepts at all, and that's correct.
+
+For each event below, extract:
+
+1. **summary**: 1-2 sentence summary of what happened.
+2. **intent**: One of: feature, bugfix, refactor, exploration, documentation, test, infrastructure, cleanup.
+3. **significance**: How much did this event shape the project's direction?
+   0.0=routine noise, 0.3=minor, 0.5=noteworthy, 0.7=important, 0.9+=milestone.
+4. **concepts**: Ideas this event relates to, at the appropriate level of abstraction:
+   - **theme**: What is this project about? The big ideas and directions that define its identity.
+     Examples: "knowledge_graph", "agent_architecture", "osint", "epistemic_reasoning"
+   - **design_bet**: Architectural choices the developer is actively pursuing within a theme.
+     Examples: "langgraph_backend", "spec_driven_generation", "owl_dl_translation"
+   - **technique**: Specific implementation mechanisms. Useful for search, not for narrative.
+     Examples: "bfs_detection", "fan_out_fix", "pagerank_scoring"
+
+   Not every event has concepts at every level. A routine bugfix may only have a technique.
+   A vision document may only have themes. Use lowercase_underscore names.
+5. **decisions**: Architectural or design decisions — moments where the developer chose one approach
+   over alternatives. Most events don't contain decisions; only extract them when genuinely present.
+{vocab_section}
 Return exactly {len(events)} analyses in the 'analyses' array, one per event, in the same order.
 
 Events:
@@ -143,7 +174,14 @@ def analyze_project(
         result.status = "completed"
         return result
 
-    logger.info("Analyzing %d events for project %d with %s", len(events), project_id, model)
+    # Gather existing concept vocabulary for this project
+    existing_concepts = [
+        c.name for c in db.list_concepts(project_id=project_id)
+    ]
+    logger.info(
+        "Analyzing %d events for project %d with %s (%d existing concepts)",
+        len(events), project_id, model, len(existing_concepts),
+    )
 
     # Create analysis run for provenance
     now = datetime.now(timezone.utc).isoformat()
@@ -172,12 +210,17 @@ def analyze_project(
             break
 
         try:
-            batch_analysis, llm_result = _analyze_batch(batch, model)
+            batch_analysis, llm_result = _analyze_batch(
+                batch, model, existing_concepts
+            )
             result.total_cost += llm_result.cost
 
-            # Store results
-            _store_batch_results(
+            # Store results and collect new concept names
+            new_concepts = _store_batch_results(
                 db, batch, batch_analysis, run_id, project_id, result
+            )
+            existing_concepts.extend(
+                c for c in new_concepts if c not in existing_concepts
             )
 
         except Exception:
@@ -204,9 +247,10 @@ def analyze_project(
 def _analyze_batch(
     events: list[EventRow],
     model: str,
+    existing_concepts: list[str],
 ) -> tuple[BatchAnalysisResult, LLMCallResult]:
     """Send a batch of events to the LLM for analysis."""
-    prompt = _build_batch_prompt(events)
+    prompt = _build_batch_prompt(events, existing_concepts)
     messages = [{"role": "user", "content": prompt}]
 
     parsed, meta = call_llm_structured(
@@ -241,8 +285,9 @@ def _store_batch_results(
     run_id: int,
     project_id: int,
     result: AnalysisResult,
-) -> None:
-    """Store analysis results in the database."""
+) -> list[str]:
+    """Store analysis results in the database. Returns new concept names."""
+    new_concepts: list[str] = []
     for event, analysis in zip(events, batch_analysis.analyses):
         # Update event with analysis
         db.update_event_analysis(
@@ -260,6 +305,7 @@ def _store_batch_results(
                 name=concept_mention.name,
                 first_seen=event.timestamp,
                 last_seen=event.timestamp,
+                level=concept_mention.level,
             )
             db.link_concept_event(
                 concept_id=concept_id,
@@ -269,6 +315,7 @@ def _store_batch_results(
                 analysis_run_id=run_id,
             )
             result.concepts_found += 1
+            new_concepts.append(concept_mention.name)
 
         # Store decisions
         for decision in analysis.decisions:
@@ -284,3 +331,4 @@ def _store_batch_results(
             result.decisions_found += 1
 
     db.conn.commit()
+    return new_concepts

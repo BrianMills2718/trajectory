@@ -161,6 +161,12 @@ class TrajectoryDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA_SQL)
+        # Idempotent migration: add level column to concepts
+        try:
+            self._conn.execute("ALTER TABLE concepts ADD COLUMN level TEXT")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         logger.info("Database initialized at %s", self.db_path)
 
     def close(self) -> None:
@@ -399,10 +405,11 @@ class TrajectoryDB:
         description: str | None = None,
         first_seen: str | None = None,
         last_seen: str | None = None,
+        level: str | None = None,
     ) -> int:
         """Insert or update a concept. Returns concept ID."""
         row = self.conn.execute(
-            "SELECT id, first_seen FROM concepts WHERE name = ?", (name,)
+            "SELECT id, first_seen, level FROM concepts WHERE name = ?", (name,)
         ).fetchone()
         if row:
             updates = ["updated_at = datetime('now')"]
@@ -417,6 +424,10 @@ class TrajectoryDB:
             if first_seen and (not row["first_seen"] or first_seen < row["first_seen"]):
                 updates.append("first_seen = ?")
                 params.append(first_seen)
+            # First extraction wins — only set level if not already set
+            if level and not row["level"]:
+                updates.append("level = ?")
+                params.append(level)
             params.append(row["id"])
             self.conn.execute(
                 f"UPDATE concepts SET {', '.join(updates)} WHERE id = ?", params
@@ -424,8 +435,8 @@ class TrajectoryDB:
             return row["id"]
 
         cursor = self.conn.execute(
-            "INSERT INTO concepts (name, description, first_seen, last_seen) VALUES (?, ?, ?, ?)",
-            (name, description, first_seen, last_seen),
+            "INSERT INTO concepts (name, description, first_seen, last_seen, level) VALUES (?, ?, ?, ?, ?)",
+            (name, description, first_seen, last_seen, level),
         )
         return cursor.lastrowid  # type: ignore[return-value]
 
@@ -489,6 +500,7 @@ class TrajectoryDB:
         self,
         status: str | None = None,
         project_id: int | None = None,
+        level: str | None = None,
     ) -> list[ConceptRow]:
         """List concepts with optional filters."""
         if project_id is not None:
@@ -498,6 +510,9 @@ class TrajectoryDB:
             if status is not None:
                 clauses.append("c.status = ?")
                 params.append(status)
+            if level is not None:
+                clauses.append("c.level = ?")
+                params.append(level)
             rows = self.conn.execute(
                 f"""SELECT DISTINCT c.* FROM concepts c
                     JOIN concept_events ce ON c.id = ce.concept_id
@@ -507,10 +522,18 @@ class TrajectoryDB:
                 params,
             ).fetchall()
         else:
+            clauses_simple: list[str] = []
+            params_simple: list[str | int] = []
             if status is not None:
+                clauses_simple.append("status = ?")
+                params_simple.append(status)
+            if level is not None:
+                clauses_simple.append("level = ?")
+                params_simple.append(level)
+            if clauses_simple:
                 rows = self.conn.execute(
-                    "SELECT * FROM concepts WHERE status = ? ORDER BY name",
-                    (status,),
+                    f"SELECT * FROM concepts WHERE {' AND '.join(clauses_simple)} ORDER BY name",
+                    params_simple,
                 ).fetchall()
             else:
                 rows = self.conn.execute(

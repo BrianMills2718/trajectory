@@ -96,10 +96,11 @@ def list_tracked_projects() -> str:
 def list_concepts(
     status: Optional[str] = None,
     project: Optional[str] = None,
+    level: Optional[str] = None,
 ) -> str:
-    """List concepts with optional filters by status or project name."""
+    """List concepts with optional filters by status, project name, or level (theme/design_bet/technique)."""
     try:
-        result = qe.list_concepts(_get_db(), status=status, project=project)
+        result = qe.list_concepts(_get_db(), status=status, project=project, level=level)
         return json.dumps(result, default=str)
     except (ValueError, FileNotFoundError) as e:
         return json.dumps({"error": str(e)})
