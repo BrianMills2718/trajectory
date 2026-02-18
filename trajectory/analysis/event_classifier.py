@@ -21,7 +21,8 @@ PROMPT_VERSION = "event_classification_v3"
 
 class ConceptMention(BaseModel):
     name: str = Field(description="Concept name, lowercase_underscore. Reuse an existing name from the vocabulary when the idea is the same.")
-    level: str = Field(description="One of: theme (what the project is about), design_bet (architectural choice being pursued), technique (implementation mechanism)")
+    level: str = Field(description="One of: theme, design_bet, technique. Use a different label if none of the three fit — but then you must fill in level_rationale.")
+    level_rationale: str | None = Field(default=None, description="Required when level is not theme/design_bet/technique. Explain what this level captures and why the standard three don't fit.")
     relationship: str = Field(description="One of: introduces, develops, refactors, abandons, completes, references")
     confidence: float = Field(ge=0.0, le=1.0, description="How confident this concept is relevant")
 
@@ -128,6 +129,9 @@ For each event below, extract:
 
    Not every event has concepts at every level. A routine bugfix may only have a technique.
    A vision document may only have themes. Use lowercase_underscore names.
+
+   If a concept genuinely doesn't fit any of the three levels, use a different label and explain
+   why in level_rationale. This helps us discover categories the taxonomy is missing.
 5. **decisions**: Architectural or design decisions — moments where the developer chose one approach
    over alternatives. Most events don't contain decisions; only extract them when genuinely present.
 {vocab_section}
@@ -306,6 +310,7 @@ def _store_batch_results(
                 first_seen=event.timestamp,
                 last_seen=event.timestamp,
                 level=concept_mention.level,
+                level_rationale=concept_mention.level_rationale,
             )
             db.link_concept_event(
                 concept_id=concept_id,

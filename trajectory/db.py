@@ -161,12 +161,13 @@ class TrajectoryDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA_SQL)
-        # Idempotent migration: add level column to concepts
-        try:
-            self._conn.execute("ALTER TABLE concepts ADD COLUMN level TEXT")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        # Idempotent migrations: add level columns to concepts
+        for col in ("level TEXT", "level_rationale TEXT"):
+            try:
+                self._conn.execute(f"ALTER TABLE concepts ADD COLUMN {col}")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         logger.info("Database initialized at %s", self.db_path)
 
     def close(self) -> None:
@@ -406,6 +407,7 @@ class TrajectoryDB:
         first_seen: str | None = None,
         last_seen: str | None = None,
         level: str | None = None,
+        level_rationale: str | None = None,
     ) -> int:
         """Insert or update a concept. Returns concept ID."""
         row = self.conn.execute(
@@ -428,6 +430,9 @@ class TrajectoryDB:
             if level and not row["level"]:
                 updates.append("level = ?")
                 params.append(level)
+                if level_rationale:
+                    updates.append("level_rationale = ?")
+                    params.append(level_rationale)
             params.append(row["id"])
             self.conn.execute(
                 f"UPDATE concepts SET {', '.join(updates)} WHERE id = ?", params
@@ -435,8 +440,8 @@ class TrajectoryDB:
             return row["id"]
 
         cursor = self.conn.execute(
-            "INSERT INTO concepts (name, description, first_seen, last_seen, level) VALUES (?, ?, ?, ?, ?)",
-            (name, description, first_seen, last_seen, level),
+            "INSERT INTO concepts (name, description, first_seen, last_seen, level, level_rationale) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, description, first_seen, last_seen, level, level_rationale),
         )
         return cursor.lastrowid  # type: ignore[return-value]
 

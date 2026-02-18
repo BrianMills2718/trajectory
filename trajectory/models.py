@@ -111,6 +111,7 @@ class ConceptRow(BaseModel):
     name: str
     description: str | None = None
     level: str | None = None
+    level_rationale: str | None = None
     first_seen: str | None = None
     last_seen: str | None = None
     status: ConceptStatus = ConceptStatus.ACTIVE
