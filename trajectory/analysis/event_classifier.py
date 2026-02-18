@@ -215,7 +215,8 @@ def analyze_project(
 
         try:
             batch_analysis, llm_result = _analyze_batch(
-                batch, model, existing_concepts
+                batch, model, existing_concepts,
+                project_id=project_id, batch_start=batch_start,
             )
             result.total_cost += llm_result.cost
 
@@ -252,6 +253,8 @@ def _analyze_batch(
     events: list[EventRow],
     model: str,
     existing_concepts: list[str],
+    project_id: int,
+    batch_start: int,
 ) -> tuple[BatchAnalysisResult, LLMCallResult]:
     """Send a batch of events to the LLM for analysis."""
     prompt = _build_batch_prompt(events, existing_concepts)
@@ -263,6 +266,8 @@ def _analyze_batch(
         response_model=BatchAnalysisResult,
         timeout=120,
         num_retries=2,
+        task="trajectory.classify_events",
+        trace_id=f"trajectory.classify.proj{project_id}.batch{batch_start}",
     )
 
     # Validate count matches

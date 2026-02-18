@@ -1,5 +1,6 @@
 """Query engine — NL question → SQL retrieval → LLM synthesis."""
 
+import hashlib
 import logging
 import re
 import sys
@@ -124,10 +125,12 @@ def query_trajectory(
         data_gaps=data_gaps,
     )
 
+    question_hash = hashlib.md5(question.encode()).hexdigest()[:12]
     result = call_llm(
         config.llm.quality_model,
         messages,
-        task="trajectory_query",
+        task="trajectory.query",
+        trace_id=f"trajectory.query.{question_hash}",
     )
 
     return QueryResult(
