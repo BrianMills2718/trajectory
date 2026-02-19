@@ -264,7 +264,7 @@ def _analyze_batch(
         model,
         messages,
         response_model=BatchAnalysisResult,
-        timeout=120,
+        timeout=300,
         num_retries=2,
         task="trajectory.classify_events",
         trace_id=f"trajectory.classify.proj{project_id}.batch{batch_start}",
