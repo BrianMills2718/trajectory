@@ -131,6 +131,7 @@ def query_trajectory(
         messages,
         task="trajectory.query",
         trace_id=f"trajectory.query.{question_hash}",
+        max_budget=0,
     )
 
     return QueryResult(

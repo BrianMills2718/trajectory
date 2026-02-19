@@ -268,6 +268,7 @@ def _analyze_batch(
         num_retries=2,
         task="trajectory.classify_events",
         trace_id=f"trajectory.classify.proj{project_id}.batch{batch_start}",
+        max_budget=0,
     )
 
     # Validate count matches
