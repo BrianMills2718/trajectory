@@ -53,22 +53,34 @@ Project trajectory tracker — tracks how ideas emerge, evolve, and spread acros
 - First-extraction-wins: if a concept already has a level, later extractions don't overwrite
 - Verified on agent_ontology: 18 themes, 38 design_bets, 69 techniques (1 off-label "process" fixed)
 
-### Current Validation Plan (2026-02-18)
+### Validation Results (2026-02-19) — GATE PASSED
 
-Before cross-project concept linking, validate multi-level extraction across diverse project types:
+Multi-level extraction validated across 3 diverse project types:
 
-1. **Re-analyze sam_gov** (664 events, data/OSINT-heavy) — wipe analysis, re-run with v3
-2. **Re-analyze llm_client** (library project) — different shape, tests level generalization
-3. **Cross-project consistency check** — do shared concepts (knowledge_graph, mcp_server) get same level across projects?
-4. **Off-label review** — `SELECT name, level, level_rationale FROM concepts WHERE level NOT IN ('theme', 'design_bet', 'technique')` — evaluate whether open vocabulary produces signal or noise
-5. **Gate**: If themes are coherent across 3+ projects → proceed to cross-project concept linking
+| Project | Events | Themes | Design Bets | Techniques | Cost |
+|---------|--------|--------|-------------|------------|------|
+| agent_ontology | 79 | 18 | 38 | 69 | $0.05 |
+| llm_client | 310 | 11 | 23 | 25 | $0.13 |
+| sam_gov | 672 | 29 | 131 | 190 | $0.26 |
+
+**Cross-project consistency**: 4 shared concepts, all with consistent levels across projects.
+**Off-label concepts**: Zero. Open vocabulary produced no noise — all concepts fit theme/design_bet/technique.
+**NULL-level concepts**: 15 (pre-v3 leftovers) → bulk-fixed to technique.
+
+**Issues found**:
+- sam_gov has 29 themes — too many. ~10 are really techniques (repository_maintenance, tag_formatting, etc.). File names leaked in as themes (TODO_ARCHITECTURE.md, PATTERNS.md). May need prompt tuning or post-hoc correction.
+- llm_client `prompt_templates` tagged 187 events — inflated by Claude Code conversations. Not a level problem, but a concept-granularity one.
+- `gemini-2.5-flash-lite` can't handle the nested Pydantic schema (nesting depth limit). Must use `gpt-5-mini` or larger.
+- Timeout needed increase from 120s → 300s for projects with 200+ existing concepts.
+
+**Verdict**: Themes are coherent across projects. Proceed to cross-project concept linking.
 
 ### What's NOT Built Yet
 
 **Next: Cross-project concept linking** (activate concept_links table)
 - Match themes across repos to show idea lineage (e.g., knowledge_graph spreading from one project to others)
 - Level filter makes this tractable: match on themes, ignore technique-level noise
-- Blocked on: multi-project level validation (above)
+- Gate passed — ready to implement
 
 **Phase 3 Remaining:**
 - Digest generation for daily/weekly summaries (deferred)
