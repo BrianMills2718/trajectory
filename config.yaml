@@ -10,7 +10,7 @@ claude_logs_dir: ~/.claude/projects
 
 # LLM settings (Phase 2)
 llm:
-  model: gemini/gemini-2.0-flash  # bulk/fast work
+  model: gemini/gemini-2.5-flash-lite  # bulk/fast work
   quality_model: anthropic/claude-sonnet-4-20250514  # quality work
   batch_size: 30  # events per LLM call
   max_cost_per_run: 1.00  # USD budget per analysis run
