@@ -187,19 +187,17 @@ def _analyze_sessions(
 
         try:
             # Build session context for prompt
+            # All keys must exist (even if None) — Jinja2 raises UndefinedError on missing dict keys
             session_contexts = []
             for s in batch:
-                ctx: dict = {}
-                if s.user_goal:
-                    ctx["user_goal"] = s.user_goal
-                if s.assistant_reasoning:
-                    ctx["assistant_reasoning"] = s.assistant_reasoning[:config.extraction.max_reasoning_chars]
-                if s.files_modified:
-                    ctx["files_modified"] = s.files_modified
-                if s.tool_sequence:
-                    ctx["tool_sequence"] = s.tool_sequence
-                if s.diff_summary:
-                    ctx["diff_summary"] = s.diff_summary
+                ctx: dict = {
+                    "user_goal": s.user_goal,
+                    "assistant_reasoning": s.assistant_reasoning[:config.extraction.max_reasoning_chars] if s.assistant_reasoning else None,
+                    "files_modified": s.files_modified,
+                    "tool_sequence": s.tool_sequence,
+                    "diff_summary": s.diff_summary,
+                    "commit_info": None,
+                }
 
                 # Get commit info
                 session_events = db.get_session_events(s.id)
@@ -211,13 +209,11 @@ def _analyze_sessions(
                             (se.event_id,),
                         ).fetchone()
                         if event:
-                            ci: dict = {
+                            commit_info.append({
                                 "hash": event["source_id"].removeprefix("git:")[:8],
                                 "title": event["title"],
-                            }
-                            if event["diff_summary"]:
-                                ci["diff_summary"] = event["diff_summary"]
-                            commit_info.append(ci)
+                                "diff_summary": event["diff_summary"],
+                            })
                 if commit_info:
                     ctx["commit_info"] = commit_info
 
@@ -328,37 +324,38 @@ def _analyze_events(
 
         try:
             # Build event context for prompt
+            # All keys must exist (even if None) — Jinja2 raises UndefinedError on missing dict keys
             event_contexts = []
             for e in batch:
-                ctx: dict = {
-                    "event_type": e.event_type,
-                    "timestamp": e.timestamp,
-                    "title": e.title,
-                }
-                if e.author:
-                    ctx["author"] = e.author
-                if e.git_branch:
-                    ctx["git_branch"] = e.git_branch
-                if e.diff_summary:
-                    ctx["diff_summary"] = e.diff_summary
-                if e.change_types:
-                    ctx["change_types"] = e.change_types
+                files_changed = None
                 if e.files_changed:
                     try:
                         files = json.loads(e.files_changed)
                         if files:
                             shown = files[:15]
-                            ctx["files_changed"] = ", ".join(shown)
+                            files_changed = ", ".join(shown)
                             if len(files) > 15:
-                                ctx["files_changed"] += f" ... and {len(files) - 15} more"
+                                files_changed += f" ... and {len(files) - 15} more"
                     except json.JSONDecodeError:
                         pass
+
+                body = None
                 if e.body:
                     body = e.body[:1500]
                     if len(e.body) > 1500:
                         body += "\n... [truncated]"
-                    ctx["body"] = body
-                event_contexts.append(ctx)
+
+                event_contexts.append({
+                    "event_type": e.event_type,
+                    "timestamp": e.timestamp,
+                    "title": e.title,
+                    "author": e.author,
+                    "git_branch": e.git_branch,
+                    "diff_summary": e.diff_summary,
+                    "change_types": e.change_types,
+                    "files_changed": files_changed,
+                    "body": body,
+                })
 
             messages = render_prompt(
                 PROMPTS_DIR / "event_classification.yaml",
