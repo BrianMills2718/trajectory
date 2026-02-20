@@ -1,19 +1,26 @@
-"""LLM-based event classification — extracts intent, concepts, significance, decisions."""
+"""LLM-based event classification — extracts intent, concepts, significance, decisions.
+
+Supports two analysis modes:
+1. Session-level: Analyzes work sessions (conversation + commits) for richer context.
+2. Event-level: Analyzes remaining orphan events (docs, archives, unlinked commits).
+"""
 
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
-from llm_client import LLMCallResult, call_llm_structured
+from llm_client import LLMCallResult, call_llm_structured, render_prompt
 from pydantic import BaseModel, Field
 
 from trajectory.config import Config
 from trajectory.db import TrajectoryDB
-from trajectory.models import EventRow
+from trajectory.models import EventRow, WorkSessionRow
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "event_classification_v3"
+PROMPT_VERSION = "event_classification_v4"
+PROMPTS_DIR = Path(__file__).parent.parent.parent / "prompts"
 
 
 # --- Pydantic response models ---
@@ -46,100 +53,7 @@ class BatchAnalysisResult(BaseModel):
     analyses: list[EventAnalysis] = Field(description="Analysis for each event, in the same order as input")
 
 
-# --- Classifier ---
-
-
-def _format_events(events: list[EventRow]) -> str:
-    """Format events for the prompt."""
-    descriptions: list[str] = []
-    for i, event in enumerate(events):
-        parts = [
-            f"[Event {i}]",
-            f"Type: {event.event_type}",
-            f"Timestamp: {event.timestamp}",
-            f"Title: {event.title}",
-        ]
-        if event.author:
-            parts.append(f"Author: {event.author}")
-        if event.git_branch:
-            parts.append(f"Branch: {event.git_branch}")
-        if event.files_changed:
-            try:
-                files = json.loads(event.files_changed)
-                if files:
-                    parts.append(f"Files changed: {', '.join(files[:15])}")
-                    if len(files) > 15:
-                        parts.append(f"  ... and {len(files) - 15} more")
-            except json.JSONDecodeError:
-                pass
-        if event.body:
-            body = event.body[:1500]
-            if len(event.body) > 1500:
-                body += "\n... [truncated]"
-            parts.append(f"Body:\n{body}")
-        descriptions.append("\n".join(parts))
-    return "\n\n---\n\n".join(descriptions)
-
-
-def _build_batch_prompt(events: list[EventRow], existing_concepts: list[str]) -> str:
-    """Build a prompt for batch event classification."""
-    events_text = _format_events(events)
-
-    vocab_section = ""
-    if existing_concepts:
-        vocab_section = f"""
-## Existing concept vocabulary
-
-These concepts have already been identified in this project. Reuse these names when an event
-relates to the same idea rather than inventing a synonym:
-
-{', '.join(existing_concepts)}
-
-You may introduce new concepts when an event genuinely brings a new idea not captured above.
-"""
-
-    return f"""You are helping build a cross-project timeline that tracks how ideas emerge, spread, and
-evolve across 60+ software projects over months. This data feeds three downstream uses:
-
-1. **Cross-project linking**: Concepts get matched across repositories to show how an idea (like
-   "mcp_server" or "knowledge_graph") spread from one project to others.
-2. **Timeline narrative**: Concepts cluster events into coherent storylines so someone can ask
-   "what happened with the ontology idea?" and get a meaningful arc, not a list of commits.
-3. **Query answering**: Users search for concepts by keyword to find relevant events.
-
-Think about it this way: if someone asked "what is this project about and where is it headed?",
-the concepts you extract should be the ideas you'd mention in your answer. They're the design bets,
-architectural choices, and recurring themes that define the project's identity and direction —
-not the implementation mechanisms used within individual commits. Many routine commits (dependency
-bumps, typo fixes, minor bug fixes) have no concepts at all, and that's correct.
-
-For each event below, extract:
-
-1. **summary**: 1-2 sentence summary of what happened.
-2. **intent**: One of: feature, bugfix, refactor, exploration, documentation, test, infrastructure, cleanup.
-3. **significance**: How much did this event shape the project's direction?
-   0.0=routine noise, 0.3=minor, 0.5=noteworthy, 0.7=important, 0.9+=milestone.
-4. **concepts**: Ideas this event relates to, at the appropriate level of abstraction:
-   - **theme**: What is this project about? The big ideas and directions that define its identity.
-     Examples: "knowledge_graph", "agent_architecture", "osint", "epistemic_reasoning"
-   - **design_bet**: Architectural choices the developer is actively pursuing within a theme.
-     Examples: "langgraph_backend", "spec_driven_generation", "owl_dl_translation"
-   - **technique**: Specific implementation mechanisms. Useful for search, not for narrative.
-     Examples: "bfs_detection", "fan_out_fix", "pagerank_scoring"
-
-   Not every event has concepts at every level. A routine bugfix may only have a technique.
-   A vision document may only have themes. Use lowercase_underscore names.
-
-   If a concept genuinely doesn't fit any of the three levels, use a different label and explain
-   why in level_rationale. This helps us discover categories the taxonomy is missing.
-5. **decisions**: Architectural or design decisions — moments where the developer chose one approach
-   over alternatives. Most events don't contain decisions; only extract them when genuinely present.
-{vocab_section}
-Return exactly {len(events)} analyses in the 'analyses' array, one per event, in the same order.
-
-Events:
-
-{events_text}"""
+# --- Analysis result tracking ---
 
 
 class AnalysisResult:
@@ -147,6 +61,7 @@ class AnalysisResult:
 
     def __init__(self) -> None:
         self.events_processed: int = 0
+        self.sessions_processed: int = 0
         self.concepts_found: int = 0
         self.decisions_found: int = 0
         self.total_cost: float = 0.0
@@ -155,37 +70,37 @@ class AnalysisResult:
     def __repr__(self) -> str:
         return (
             f"AnalysisResult({self.events_processed} events, "
+            f"{self.sessions_processed} sessions, "
             f"{self.concepts_found} concepts, {self.decisions_found} decisions, "
             f"${self.total_cost:.4f}, {self.status})"
         )
+
+
+# --- Main entry point ---
 
 
 def analyze_project(
     project_id: int,
     db: TrajectoryDB,
     config: Config,
+    force_reanalyze: bool = False,
 ) -> AnalysisResult:
-    """Run LLM analysis on all unanalyzed events for a project."""
+    """Run LLM analysis on a project.
+
+    1. Analyze unanalyzed sessions (richer context)
+    2. Analyze remaining unanalyzed events (docs, archives, orphan commits)
+    """
     result = AnalysisResult()
     model = config.llm.model
-    batch_size = config.llm.batch_size
     max_cost = config.llm.max_cost_per_run
 
-    # Get unanalyzed events
-    events = db.get_unanalyzed_events(project_id, limit=5000)
-    if not events:
-        logger.info("No unanalyzed events for project %d", project_id)
-        result.status = "completed"
-        return result
+    if force_reanalyze:
+        _clear_analysis(db, project_id)
 
     # Gather existing concept vocabulary for this project
     existing_concepts = [
         c.name for c in db.list_concepts(project_id=project_id)
     ]
-    logger.info(
-        "Analyzing %d events for project %d with %s (%d existing concepts)",
-        len(events), project_id, model, len(existing_concepts),
-    )
 
     # Create analysis run for provenance
     now = datetime.now(timezone.utc).isoformat()
@@ -196,43 +111,35 @@ def analyze_project(
         started_at=now,
     )
 
-    # Process in batches
-    for batch_start in range(0, len(events), batch_size):
-        batch = events[batch_start:batch_start + batch_size]
+    # Phase 1: Session-level analysis
+    sessions = db.get_unanalyzed_sessions(project_id)
+    if sessions:
         logger.info(
-            "Processing batch %d-%d of %d",
-            batch_start, batch_start + len(batch), len(events),
+            "Analyzing %d sessions for project %d with %s",
+            len(sessions), project_id, model,
+        )
+        new_concepts = _analyze_sessions(
+            sessions, db, config, run_id, project_id, existing_concepts, result,
+        )
+        existing_concepts.extend(c for c in new_concepts if c not in existing_concepts)
+
+    # Phase 2: Event-level analysis for remaining events
+    events = db.get_unanalyzed_events(project_id, limit=5000)
+    if events:
+        logger.info(
+            "Analyzing %d remaining events for project %d with %s (%d existing concepts)",
+            len(events), project_id, model, len(existing_concepts),
+        )
+        _analyze_events(
+            events, db, config, run_id, project_id, existing_concepts, result,
         )
 
-        # Check cost budget
-        if result.total_cost >= max_cost:
-            logger.warning(
-                "Cost budget exceeded: $%.4f >= $%.2f. Stopping.",
-                result.total_cost, max_cost,
-            )
-            result.status = "budget_exceeded"
-            break
+    if not sessions and not events:
+        logger.info("No unanalyzed sessions or events for project %d", project_id)
+        result.status = "completed"
 
-        try:
-            batch_analysis, llm_result = _analyze_batch(
-                batch, model, existing_concepts,
-                project_id=project_id, batch_start=batch_start,
-            )
-            result.total_cost += llm_result.cost
-
-            # Store results and collect new concept names
-            new_concepts = _store_batch_results(
-                db, batch, batch_analysis, run_id, project_id, result
-            )
-            existing_concepts.extend(
-                c for c in new_concepts if c not in existing_concepts
-            )
-
-        except Exception:
-            logger.exception("Error analyzing batch starting at %d", batch_start)
-            result.status = "failed"
-            break
-    else:
+    # Check final status
+    if result.status == "running":
         result.status = "completed"
 
     # Update analysis run
@@ -249,97 +156,321 @@ def analyze_project(
     return result
 
 
-def _analyze_batch(
-    events: list[EventRow],
-    model: str,
-    existing_concepts: list[str],
-    project_id: int,
-    batch_start: int,
-) -> tuple[BatchAnalysisResult, LLMCallResult]:
-    """Send a batch of events to the LLM for analysis."""
-    prompt = _build_batch_prompt(events, existing_concepts)
-    messages = [{"role": "user", "content": prompt}]
-
-    parsed, meta = call_llm_structured(
-        model,
-        messages,
-        response_model=BatchAnalysisResult,
-        timeout=300,
-        num_retries=2,
-        task="trajectory.classify_events",
-        trace_id=f"trajectory.classify.proj{project_id}.batch{batch_start}",
-        max_budget=0,
-    )
-
-    # Validate count matches
-    if len(parsed.analyses) != len(events):
-        logger.warning(
-            "LLM returned %d analyses for %d events. Truncating/padding.",
-            len(parsed.analyses), len(events),
-        )
-        # Pad with minimal analyses if needed
-        while len(parsed.analyses) < len(events):
-            parsed.analyses.append(EventAnalysis(
-                summary="Analysis not available",
-                intent="cleanup",
-                significance=0.1,
-            ))
-
-    return parsed, meta
+# --- Session analysis ---
 
 
-def _store_batch_results(
+def _analyze_sessions(
+    sessions: list[WorkSessionRow],
     db: TrajectoryDB,
+    config: Config,
+    run_id: int,
+    project_id: int,
+    existing_concepts: list[str],
+    result: AnalysisResult,
+) -> list[str]:
+    """Analyze sessions in batches. Returns list of new concept names."""
+    model = config.llm.model
+    batch_size = config.llm.session_batch_size
+    max_cost = config.llm.max_cost_per_run
+    all_new_concepts: list[str] = []
+
+    for batch_start in range(0, len(sessions), batch_size):
+        batch = sessions[batch_start:batch_start + batch_size]
+
+        if result.total_cost >= max_cost:
+            logger.warning(
+                "Cost budget exceeded: $%.4f >= $%.2f. Stopping.",
+                result.total_cost, max_cost,
+            )
+            result.status = "budget_exceeded"
+            break
+
+        try:
+            # Build session context for prompt
+            session_contexts = []
+            for s in batch:
+                ctx: dict = {}
+                if s.user_goal:
+                    ctx["user_goal"] = s.user_goal
+                if s.assistant_reasoning:
+                    ctx["assistant_reasoning"] = s.assistant_reasoning[:config.extraction.max_reasoning_chars]
+                if s.files_modified:
+                    ctx["files_modified"] = s.files_modified
+                if s.tool_sequence:
+                    ctx["tool_sequence"] = s.tool_sequence
+                if s.diff_summary:
+                    ctx["diff_summary"] = s.diff_summary
+
+                # Get commit info
+                session_events = db.get_session_events(s.id)
+                commit_info = []
+                for se in session_events:
+                    if se.role == "commit":
+                        event = db.conn.execute(
+                            "SELECT source_id, title, diff_summary FROM events WHERE id = ?",
+                            (se.event_id,),
+                        ).fetchone()
+                        if event:
+                            ci: dict = {
+                                "hash": event["source_id"].removeprefix("git:")[:8],
+                                "title": event["title"],
+                            }
+                            if event["diff_summary"]:
+                                ci["diff_summary"] = event["diff_summary"]
+                            commit_info.append(ci)
+                if commit_info:
+                    ctx["commit_info"] = commit_info
+
+                session_contexts.append(ctx)
+
+            messages = render_prompt(
+                PROMPTS_DIR / "session_classification.yaml",
+                sessions=session_contexts,
+                session_count=len(batch),
+                existing_concepts=existing_concepts if existing_concepts else None,
+            )
+
+            parsed, meta = call_llm_structured(
+                model,
+                messages,
+                response_model=BatchAnalysisResult,
+                timeout=300,
+                num_retries=2,
+                task="trajectory.classify_sessions",
+                trace_id=f"trajectory.classify_sessions.proj{project_id}.batch{batch_start}",
+                max_budget=0,
+            )
+            result.total_cost += meta.cost
+
+            # Pad if needed
+            while len(parsed.analyses) < len(batch):
+                parsed.analyses.append(EventAnalysis(
+                    summary="Analysis not available",
+                    intent="cleanup",
+                    significance=0.1,
+                ))
+
+            # Store results: update session, propagate to constituent events
+            for session, analysis in zip(batch, parsed.analyses):
+                db.update_session_analysis(
+                    session_id=session.id,
+                    llm_summary=analysis.summary,
+                    llm_intent=analysis.intent,
+                    significance=analysis.significance,
+                    analysis_run_id=run_id,
+                )
+                result.sessions_processed += 1
+
+                # Propagate to all events in this session
+                session_events = db.get_session_events(session.id)
+                for se in session_events:
+                    db.update_event_analysis(
+                        event_id=se.event_id,
+                        llm_summary=analysis.summary,
+                        llm_intent=analysis.intent,
+                        significance=analysis.significance,
+                        analysis_run_id=run_id,
+                    )
+                    result.events_processed += 1
+
+                # Store concepts and decisions (linked to conversation event or first commit)
+                anchor_event_id = session.conversation_event_id
+                if not anchor_event_id and session_events:
+                    anchor_event_id = session_events[0].event_id
+
+                if anchor_event_id:
+                    new_concepts = _store_concepts_and_decisions(
+                        db, anchor_event_id, analysis, run_id, project_id, result,
+                        event_timestamp=session.session_start,
+                    )
+                    all_new_concepts.extend(new_concepts)
+                    existing_concepts.extend(
+                        c for c in new_concepts if c not in existing_concepts
+                    )
+
+            db.conn.commit()
+
+        except Exception:
+            logger.exception("Error analyzing session batch starting at %d", batch_start)
+            result.status = "failed"
+            break
+
+    return all_new_concepts
+
+
+# --- Event analysis ---
+
+
+def _analyze_events(
     events: list[EventRow],
-    batch_analysis: BatchAnalysisResult,
+    db: TrajectoryDB,
+    config: Config,
+    run_id: int,
+    project_id: int,
+    existing_concepts: list[str],
+    result: AnalysisResult,
+) -> None:
+    """Analyze individual events in batches."""
+    model = config.llm.model
+    batch_size = config.llm.batch_size
+    max_cost = config.llm.max_cost_per_run
+
+    for batch_start in range(0, len(events), batch_size):
+        batch = events[batch_start:batch_start + batch_size]
+
+        if result.total_cost >= max_cost:
+            logger.warning(
+                "Cost budget exceeded: $%.4f >= $%.2f. Stopping.",
+                result.total_cost, max_cost,
+            )
+            result.status = "budget_exceeded"
+            break
+
+        try:
+            # Build event context for prompt
+            event_contexts = []
+            for e in batch:
+                ctx: dict = {
+                    "event_type": e.event_type,
+                    "timestamp": e.timestamp,
+                    "title": e.title,
+                }
+                if e.author:
+                    ctx["author"] = e.author
+                if e.git_branch:
+                    ctx["git_branch"] = e.git_branch
+                if e.diff_summary:
+                    ctx["diff_summary"] = e.diff_summary
+                if e.change_types:
+                    ctx["change_types"] = e.change_types
+                if e.files_changed:
+                    try:
+                        files = json.loads(e.files_changed)
+                        if files:
+                            shown = files[:15]
+                            ctx["files_changed"] = ", ".join(shown)
+                            if len(files) > 15:
+                                ctx["files_changed"] += f" ... and {len(files) - 15} more"
+                    except json.JSONDecodeError:
+                        pass
+                if e.body:
+                    body = e.body[:1500]
+                    if len(e.body) > 1500:
+                        body += "\n... [truncated]"
+                    ctx["body"] = body
+                event_contexts.append(ctx)
+
+            messages = render_prompt(
+                PROMPTS_DIR / "event_classification.yaml",
+                events=event_contexts,
+                event_count=len(batch),
+                existing_concepts=existing_concepts if existing_concepts else None,
+            )
+
+            parsed, meta = call_llm_structured(
+                model,
+                messages,
+                response_model=BatchAnalysisResult,
+                timeout=300,
+                num_retries=2,
+                task="trajectory.classify_events",
+                trace_id=f"trajectory.classify_events.proj{project_id}.batch{batch_start}",
+                max_budget=0,
+            )
+            result.total_cost += meta.cost
+
+            # Pad if needed
+            while len(parsed.analyses) < len(batch):
+                parsed.analyses.append(EventAnalysis(
+                    summary="Analysis not available",
+                    intent="cleanup",
+                    significance=0.1,
+                ))
+
+            # Store results
+            for event, analysis in zip(batch, parsed.analyses):
+                db.update_event_analysis(
+                    event_id=event.id,
+                    llm_summary=analysis.summary,
+                    llm_intent=analysis.intent,
+                    significance=analysis.significance,
+                    analysis_run_id=run_id,
+                )
+                result.events_processed += 1
+
+                new_concepts = _store_concepts_and_decisions(
+                    db, event.id, analysis, run_id, project_id, result,
+                    event_timestamp=event.timestamp,
+                )
+                existing_concepts.extend(
+                    c for c in new_concepts if c not in existing_concepts
+                )
+
+            db.conn.commit()
+
+        except Exception:
+            logger.exception("Error analyzing event batch starting at %d", batch_start)
+            result.status = "failed"
+            break
+
+
+# --- Shared helpers ---
+
+
+def _store_concepts_and_decisions(
+    db: TrajectoryDB,
+    event_id: int,
+    analysis: EventAnalysis,
     run_id: int,
     project_id: int,
     result: AnalysisResult,
+    event_timestamp: str,
 ) -> list[str]:
-    """Store analysis results in the database. Returns new concept names."""
+    """Store concepts and decisions from an analysis. Returns new concept names."""
     new_concepts: list[str] = []
-    for event, analysis in zip(events, batch_analysis.analyses):
-        # Update event with analysis
-        db.update_event_analysis(
-            event_id=event.id,
-            llm_summary=analysis.summary,
-            llm_intent=analysis.intent,
-            significance=analysis.significance,
+
+    for concept_mention in analysis.concepts:
+        concept_id = db.upsert_concept(
+            name=concept_mention.name,
+            first_seen=event_timestamp,
+            last_seen=event_timestamp,
+            level=concept_mention.level,
+            level_rationale=concept_mention.level_rationale,
+        )
+        db.link_concept_event(
+            concept_id=concept_id,
+            event_id=event_id,
+            relationship=concept_mention.relationship,
+            confidence=concept_mention.confidence,
             analysis_run_id=run_id,
         )
-        result.events_processed += 1
+        result.concepts_found += 1
+        new_concepts.append(concept_mention.name)
 
-        # Store concepts and links
-        for concept_mention in analysis.concepts:
-            concept_id = db.upsert_concept(
-                name=concept_mention.name,
-                first_seen=event.timestamp,
-                last_seen=event.timestamp,
-                level=concept_mention.level,
-                level_rationale=concept_mention.level_rationale,
-            )
-            db.link_concept_event(
-                concept_id=concept_id,
-                event_id=event.id,
-                relationship=concept_mention.relationship,
-                confidence=concept_mention.confidence,
-                analysis_run_id=run_id,
-            )
-            result.concepts_found += 1
-            new_concepts.append(concept_mention.name)
+    for decision in analysis.decisions:
+        db.insert_decision(
+            event_id=event_id,
+            project_id=project_id,
+            title=decision.title,
+            reasoning=decision.reasoning,
+            alternatives=json.dumps(decision.alternatives) if decision.alternatives else None,
+            decision_type=decision.decision_type,
+            analysis_run_id=run_id,
+        )
+        result.decisions_found += 1
 
-        # Store decisions
-        for decision in analysis.decisions:
-            db.insert_decision(
-                event_id=event.id,
-                project_id=project_id,
-                title=decision.title,
-                reasoning=decision.reasoning,
-                alternatives=json.dumps(decision.alternatives) if decision.alternatives else None,
-                decision_type=decision.decision_type,
-                analysis_run_id=run_id,
-            )
-            result.decisions_found += 1
-
-    db.conn.commit()
     return new_concepts
+
+
+def _clear_analysis(db: TrajectoryDB, project_id: int) -> None:
+    """Clear all analysis results for a project (for force-reanalyze)."""
+    db.conn.execute(
+        "UPDATE events SET llm_summary = NULL, llm_intent = NULL, significance = NULL, analysis_run_id = NULL WHERE project_id = ?",
+        (project_id,),
+    )
+    db.conn.execute(
+        "UPDATE work_sessions SET llm_summary = NULL, llm_intent = NULL, significance = NULL, analysis_run_id = NULL WHERE project_id = ?",
+        (project_id,),
+    )
+    db.conn.commit()
+    logger.info("Cleared analysis for project %d", project_id)

@@ -13,6 +13,7 @@ llm:
   model: gpt-5-mini  # gemini-2.5-flash-lite can't handle nested schema
   quality_model: anthropic/claude-sonnet-4-20250514  # quality work
   batch_size: 30  # events per LLM call
+  session_batch_size: 10  # sessions per LLM call
   max_cost_per_run: 1.00  # USD budget per analysis run
 
 # Extraction settings
@@ -29,6 +30,10 @@ extraction:
     - "archive"
   # Max file size to read (bytes)
   max_file_size: 500000  # 500KB
+  # Per-file diff: max added lines to include in summary
+  max_diff_lines: 5
+  # Max chars of assistant reasoning to store per session
+  max_reasoning_chars: 3000
 
 # Digest settings (Phase 3)
 digest:

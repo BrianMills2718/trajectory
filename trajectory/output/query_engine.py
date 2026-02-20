@@ -3,12 +3,7 @@
 import hashlib
 import logging
 import re
-import sys
 from pathlib import Path
-
-_llm_client_path = str(Path.home() / "projects" / "llm_client")
-if _llm_client_path not in sys.path:
-    sys.path.insert(0, _llm_client_path)
 
 from llm_client import call_llm, render_prompt
 

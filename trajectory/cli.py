@@ -9,6 +9,7 @@ from trajectory.analysis.concept_linker import link_concepts
 from trajectory.analysis.event_classifier import analyze_project
 from trajectory.config import load_config
 from trajectory.db import TrajectoryDB
+from trajectory.extractors.session_builder import build_sessions
 from trajectory.ingest import ingest_all_projects, ingest_project
 
 
@@ -21,6 +22,10 @@ def main() -> None:
     ingest_parser = sub.add_parser("ingest", help="Ingest project events")
     ingest_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     ingest_parser.add_argument(
+        "--backfill", action="store_true",
+        help="Re-extract all events and update enrichment columns (diff_summary, change_types)",
+    )
+    ingest_parser.add_argument(
         "project_path",
         nargs="?",
         help="Path to a specific project. If omitted, ingests all projects.",
@@ -30,8 +35,21 @@ def main() -> None:
     analyze_parser = sub.add_parser("analyze", help="Run LLM analysis on events")
     analyze_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     analyze_parser.add_argument(
+        "--force-reanalyze", action="store_true",
+        help="Clear existing analysis and re-analyze all events/sessions",
+    )
+    analyze_parser.add_argument(
         "project_path",
         help="Path to the project to analyze",
+    )
+
+    # build-sessions command
+    sessions_parser = sub.add_parser("build-sessions", help="Build work sessions linking conversations to commits")
+    sessions_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    sessions_parser.add_argument(
+        "project_path",
+        nargs="?",
+        help="Path to a specific project. If omitted, builds for all projects.",
     )
 
     # query command
@@ -61,10 +79,12 @@ def main() -> None:
     try:
         if args.command == "ingest":
             if args.project_path:
-                result = ingest_project(Path(args.project_path), db, config)
+                result = ingest_project(
+                    Path(args.project_path), db, config, backfill=args.backfill,
+                )
                 print(result)
             else:
-                results = ingest_all_projects(db, config)
+                results = ingest_all_projects(db, config, backfill=args.backfill)
                 for r in results:
                     print(r)
                 print(f"\nTotal: {len(results)} projects, {sum(r.total_new for r in results)} new events")
@@ -74,7 +94,10 @@ def main() -> None:
             if not project:
                 print(f"Project not found. Run 'ingest' first for {args.project_path}")
                 return
-            result = analyze_project(project.id, db, config)
+            result = analyze_project(
+                project.id, db, config,
+                force_reanalyze=args.force_reanalyze,
+            )
             print(result)
 
             # Show concepts found
@@ -85,6 +108,17 @@ def main() -> None:
                 print(f"\nConcepts ({len(rows)}):")
                 for r in rows:
                     print(f"  {r['name']} (first: {r['first_seen'][:10] if r['first_seen'] else '?'}, last: {r['last_seen'][:10] if r['last_seen'] else '?'})")
+
+        elif args.command == "build-sessions":
+            if args.project_path:
+                project = db.get_project_by_path(str(Path(args.project_path).resolve()))
+                if not project:
+                    print(f"Project not found. Run 'ingest' first for {args.project_path}")
+                    return
+                result = build_sessions(db, project_id=project.id)
+            else:
+                result = build_sessions(db)
+            print(result)
 
         elif args.command == "link":
             result = link_concepts(db, config)
@@ -125,7 +159,12 @@ def main() -> None:
                 return
             for p in projects:
                 total = db.count_events(p.id)
-                print(f"  {p.name}: {total} events ({p.total_commits} commits, {p.total_conversations} conversations), last ingested: {p.last_ingested}")
+                sessions = db.get_sessions(project_id=p.id, limit=10000)
+                print(
+                    f"  {p.name}: {total} events, {len(sessions)} sessions "
+                    f"({p.total_commits} commits, {p.total_conversations} conversations), "
+                    f"last ingested: {p.last_ingested}"
+                )
 
         else:
             parser.print_help()

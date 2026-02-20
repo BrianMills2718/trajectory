@@ -10,16 +10,19 @@ Project trajectory tracker — tracks how ideas emerge, evolve, and spread acros
 
 **Phase 1: Extractors + SQLite** — COMPLETE
 - `trajectory/config.py` + `config.yaml` — Pydantic config loaded from YAML
-- `trajectory/models.py` — All Pydantic models (EventType, Intent, ConceptStatus, QueryResult, etc.)
-- `trajectory/db.py` — SQLite with WAL mode, full schema (9 tables), all CRUD + query + correction operations
-- `trajectory/extractors/git_extractor.py` — PyDriller-based commit extraction
-- `trajectory/extractors/claude_log_extractor.py` — JSONL parser for Claude Code logs with smart log dir matching (handles path aliases)
+- `trajectory/models.py` — All Pydantic models (EventType, Intent, ConceptStatus, QueryResult, WorkSessionRow, etc.)
+- `trajectory/db.py` — SQLite with WAL mode, full schema (11 tables), all CRUD + query + correction + session operations
+- `trajectory/extractors/git_extractor.py` — PyDriller-based commit extraction with diff summaries and change types
+- `trajectory/extractors/claude_log_extractor.py` — JSONL parser with enriched extraction (commit hashes, files modified/examined, tool sequence, assistant reasoning). Scans both project-specific AND catch-all parent log directories
 - `trajectory/extractors/doc_extractor.py` — Extracts from CLAUDE.md, STATUS.md, archive dirs, docs/archive dirs
-- `trajectory/ingest.py` — Orchestrator that runs all 3 extractors with dedup by source_id
-- `trajectory/cli.py` — CLI with `ingest`, `analyze`, `stats`, `query`, `link` commands
+- `trajectory/extractors/session_builder.py` — Links conversations to commits via hash matching, groups orphan commits by day
+- `trajectory/ingest.py` — Orchestrator that runs all 3 extractors with dedup by source_id, supports `--backfill`
+- `trajectory/cli.py` — CLI with `ingest`, `analyze`, `build-sessions`, `stats`, `query`, `link` commands
 
 **Phase 2: LLM Analysis** — COMPLETE
-- `trajectory/analysis/event_classifier.py` — Batches events (30 at a time), sends to LLM via `call_llm_structured()`, extracts intent, summary, concepts, significance (0.0-1.0), and decisions
+- `trajectory/analysis/event_classifier.py` — Two-phase: session-level analysis first (richer context), then remaining orphan events. Prompts loaded from YAML templates via `render_prompt()`
+- `prompts/session_classification.yaml` — Jinja2 template for session-level analysis (user goal + reasoning + files + commits)
+- `prompts/event_classification.yaml` — Jinja2 template for event-level analysis (migrated from inline f-string)
 - Uses Pydantic response models: `EventAnalysis`, `ConceptMention`, `DecisionFound`, `BatchAnalysisResult`
 - Provenance tracking via `analysis_runs` table (model, prompt version, cost)
 - Cost budget enforcement (stops if exceeds `max_cost_per_run`)
@@ -39,11 +42,14 @@ Project trajectory tracker — tracks how ideas emerge, evolve, and spread acros
 - All 664 events analyzed by LLM
 - Concepts, decisions, significance scores all stored in SQLite
 
-**Test Suite: 57 tests passing**
-- `tests/test_db.py` — 26 tests for DB query and correction methods
+**Test Suite: 96 tests passing**
+- `tests/test_db.py` — 34 tests for DB query, correction, session, and backfill methods
 - `tests/test_query_engine.py` — 16 tests for query engine functions (LLM calls mocked)
 - `tests/test_mcp_server.py` — 4 tests for tool registration and JSON returns
 - `tests/test_concept_linker.py` — 11 tests for concept link DB methods, query engine, and MCP tool
+- `tests/test_claude_log_extractor.py` — 15 tests for enriched extraction (commit hashes, files, reasoning, catch-all dirs)
+- `tests/test_git_extractor.py` — 6 tests for diff summary generation
+- `tests/test_session_builder.py` — 10 tests for session creation, orphan grouping, dedup
 
 **Multi-Level Concept Extraction (2026-02-18):**
 - Concepts now carry a `level`: theme (project identity), design_bet (architectural choice), technique (implementation mechanism)
@@ -110,12 +116,13 @@ trajectory/
 │   ├── mcp_server.py              # MCP server — 7 tools
 │   ├── extractors/
 │   │   ├── base.py                # BaseExtractor ABC
-│   │   ├── git_extractor.py       # PyDriller commit extraction
-│   │   ├── claude_log_extractor.py # JSONL conversation log parser
-│   │   └── doc_extractor.py       # CLAUDE.md/STATUS.md/archive parser
+│   │   ├── git_extractor.py       # PyDriller commit extraction + diff summaries
+│   │   ├── claude_log_extractor.py # JSONL parser — enriched extraction + catch-all scanning
+│   │   ├── doc_extractor.py       # CLAUDE.md/STATUS.md/archive parser
+│   │   └── session_builder.py     # Links conversations to commits → work_sessions
 │   ├── analysis/
-│   │   ├── __init__.py            # Adds llm_client to sys.path
-│   │   ├── event_classifier.py    # LLM batch classification
+│   │   ├── __init__.py
+│   │   ├── event_classifier.py    # Session-level + event-level LLM classification
 │   │   └── concept_linker.py      # Cross-project concept linking
 │   └── output/
 │       └── query_engine.py        # NL query → SQL → LLM synthesis
@@ -123,19 +130,27 @@ trajectory/
 │   └── trajectory.db              # SQLite database (gitignored)
 ├── prompts/
 │   ├── query_synthesis.yaml       # Jinja2 template for query synthesis
-│   └── concept_linking.yaml       # Jinja2 template for concept linking
+│   ├── concept_linking.yaml       # Jinja2 template for concept linking
+│   ├── session_classification.yaml # Jinja2 template for session-level analysis
+│   └── event_classification.yaml  # Jinja2 template for event-level analysis
 ├── templates/                     # Empty — for D3.js HTML later
 └── tests/
     ├── conftest.py                # Shared fixtures (tmp_db, populated_db)
-    ├── test_db.py                 # 26 DB method tests
+    ├── test_db.py                 # 34 DB method tests
     ├── test_query_engine.py       # 16 query engine tests
-    └── test_mcp_server.py         # 4 MCP server tests
+    ├── test_mcp_server.py         # 4 MCP server tests
+    ├── test_concept_linker.py     # 11 concept link tests
+    ├── test_claude_log_extractor.py # 15 enriched extraction tests
+    ├── test_git_extractor.py      # 6 diff summary tests
+    └── test_session_builder.py    # 10 session builder tests
 ```
 
-## Database Schema (9 tables)
+## Database Schema (11 tables)
 
 - `projects` — tracked repos (name, path, git_remote, stats, last_ingested)
-- `events` — unified timeline (commit/conversation/doc_change/archive events with LLM analysis fields)
+- `events` — unified timeline (commit/conversation/doc_change/archive events with LLM analysis fields, diff_summary, change_types, session_id)
+- `work_sessions` — conversations linked to their commits (user_goal, tool_sequence, files_modified, commit_hashes, assistant_reasoning, diff_summary)
+- `session_events` — junction table linking sessions to events with role (conversation/commit)
 - `concepts` — ideas/patterns that emerge and evolve (name, level, level_rationale, status, first_seen, last_seen)
 - `concept_events` — links events to concepts with relationship type and confidence
 - `decisions` — architectural/design decisions extracted from events
@@ -148,7 +163,8 @@ trajectory/
 
 - **llm_client**: Uses `/home/brian/projects/llm_client` (pip installed in .venv). Default model: gemini-flash for bulk work, quality_model (claude-sonnet) for synthesis.
 - **Dedup**: Events deduplicated by `source_id` (UNIQUE constraint). Format: `git:{hash}`, `claude:{session_id}`, `doc:{project}/{path}`
-- **Claude log key matching**: Claude Code log dirs use hyphenated paths (`-home-brian-sam-gov`). The extractor tries exact key match first, then falls back to suffix matching for path aliases.
+- **Claude log matching**: Three-tier lookup: (1) exact path key match, (2) suffix match for aliases, (3) catch-all parent directory scan. Catch-all scan uses streaming 1MB-chunk binary search with early exit — handles 5.3GB / 145 files in ~1 second.
+- **Work sessions**: A conversation + the commits it produced. Session builder matches short commit hashes from Claude logs to git events via `source_id` prefix. Orphan commits (no conversation) grouped by day.
 - **Incremental processing**: Tracks `last_ingested` per project. Extractors accept `since` parameter. Re-runs only process new events.
 - **Batch analysis**: 30 events per LLM call. Cost budget per run (default $1.00). Provenance tracked per analysis run.
 - **Flattened Pydantic models**: Gemini has a nesting depth limit for structured output. The classifier uses `FlatEventAnalysis` with `concepts_json`/`decisions_json` as JSON strings, then `_unflatten_analysis()` converts back to rich typed models after the LLM call.
@@ -164,11 +180,20 @@ source .venv/bin/activate
 # Ingest a single project
 python -m trajectory.cli ingest /home/brian/projects/sam_gov
 
+# Ingest with backfill (re-enrich existing events with diff summaries)
+python -m trajectory.cli ingest --backfill /home/brian/projects/sam_gov
+
 # Ingest all projects under ~/projects
 python -m trajectory.cli ingest
 
+# Build work sessions (link conversations to commits)
+python -m trajectory.cli build-sessions
+
 # Run LLM analysis on ingested events
 python -m trajectory.cli analyze /home/brian/projects/sam_gov
+
+# Force re-analyze all events (useful after prompt changes)
+python -m trajectory.cli analyze --force-reanalyze /home/brian/projects/sam_gov
 
 # Find cross-project concept links (LLM-powered, theme-level only)
 python -m trajectory.cli link

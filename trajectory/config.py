@@ -8,9 +8,10 @@ from pydantic import BaseModel, Field
 
 
 class LLMConfig(BaseModel):
-    model: str = "gemini/gemini-2.0-flash"
+    model: str = "gpt-5-mini"
     quality_model: str = "anthropic/claude-sonnet-4-20250514"
     batch_size: int = 30
+    session_batch_size: int = 10
     max_cost_per_run: float = 1.00
 
 
@@ -22,6 +23,8 @@ class ExtractionConfig(BaseModel):
         "docs/archive", "archive",
     ])
     max_file_size: int = 500_000
+    max_diff_lines: int = 5
+    max_reasoning_chars: int = 3000
 
 
 class DigestConfig(BaseModel):

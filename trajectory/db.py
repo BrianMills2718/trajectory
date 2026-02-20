@@ -14,6 +14,8 @@ from trajectory.models import (
     EventRow,
     ExtractedEvent,
     ProjectRow,
+    SessionEventRow,
+    WorkSessionRow,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,6 +132,33 @@ CREATE TABLE IF NOT EXISTS digests (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS work_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    conversation_event_id INTEGER REFERENCES events(id),
+    session_start TEXT NOT NULL,
+    session_end TEXT NOT NULL,
+    user_goal TEXT,
+    tool_sequence TEXT,
+    files_modified TEXT,
+    commit_hashes TEXT,
+    assistant_reasoning TEXT,
+    diff_summary TEXT,
+    llm_summary TEXT,
+    llm_intent TEXT,
+    significance REAL,
+    analysis_run_id INTEGER REFERENCES analysis_runs(id),
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES work_sessions(id),
+    event_id INTEGER NOT NULL REFERENCES events(id),
+    role TEXT NOT NULL,
+    UNIQUE(session_id, event_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_project_ts ON events(project_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_significance ON events(significance);
@@ -138,6 +167,9 @@ CREATE INDEX IF NOT EXISTS idx_concept_events_event ON concept_events(event_id);
 CREATE INDEX IF NOT EXISTS idx_concepts_status ON concepts(status);
 CREATE INDEX IF NOT EXISTS idx_corrections_target ON corrections(target_type, target_id);
 CREATE INDEX IF NOT EXISTS idx_digests_type_period ON digests(digest_type, period_start);
+CREATE INDEX IF NOT EXISTS idx_work_sessions_project ON work_sessions(project_id);
+CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_events_event ON session_events(event_id);
 """
 
 
@@ -162,10 +194,17 @@ class TrajectoryDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA_SQL)
-        # Idempotent migrations: add level columns to concepts
-        for col in ("level TEXT", "level_rationale TEXT"):
+        # Idempotent migrations
+        migrations = [
+            ("concepts", "level TEXT"),
+            ("concepts", "level_rationale TEXT"),
+            ("events", "diff_summary TEXT"),
+            ("events", "change_types TEXT"),
+            ("events", "session_id INTEGER REFERENCES work_sessions(id)"),
+        ]
+        for table, col in migrations:
             try:
-                self._conn.execute(f"ALTER TABLE concepts ADD COLUMN {col}")
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass  # Column already exists
@@ -260,8 +299,9 @@ class TrajectoryDB:
         try:
             cursor = self.conn.execute(
                 """INSERT INTO events
-                   (project_id, event_type, source_id, timestamp, author, title, body, raw_data, files_changed, git_branch)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (project_id, event_type, source_id, timestamp, author, title, body,
+                    raw_data, files_changed, git_branch, diff_summary, change_types)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     event.project_id,
                     event.event_type,
@@ -273,6 +313,8 @@ class TrajectoryDB:
                     event.raw_data,
                     event.files_changed,
                     event.git_branch,
+                    event.diff_summary,
+                    event.change_types,
                 ),
             )
             return cursor.lastrowid
@@ -481,6 +523,135 @@ class TrajectoryDB:
             (event_id, project_id, title, reasoning, alternatives, decision_type, analysis_run_id),
         )
         return cursor.lastrowid  # type: ignore[return-value]
+
+    # --- Session operations ---
+
+    def insert_work_session(
+        self,
+        project_id: int,
+        session_start: str,
+        session_end: str,
+        conversation_event_id: int | None = None,
+        user_goal: str | None = None,
+        tool_sequence: str | None = None,
+        files_modified: str | None = None,
+        commit_hashes: str | None = None,
+        assistant_reasoning: str | None = None,
+        diff_summary: str | None = None,
+    ) -> int:
+        """Insert a work session. Returns session ID."""
+        cursor = self.conn.execute(
+            """INSERT INTO work_sessions
+               (project_id, conversation_event_id, session_start, session_end,
+                user_goal, tool_sequence, files_modified, commit_hashes,
+                assistant_reasoning, diff_summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (project_id, conversation_event_id, session_start, session_end,
+             user_goal, tool_sequence, files_modified, commit_hashes,
+             assistant_reasoning, diff_summary),
+        )
+        self.conn.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    def insert_session_event(
+        self,
+        session_id: int,
+        event_id: int,
+        role: str,
+    ) -> None:
+        """Link an event to a session. Skips if already linked."""
+        try:
+            self.conn.execute(
+                "INSERT INTO session_events (session_id, event_id, role) VALUES (?, ?, ?)",
+                (session_id, event_id, role),
+            )
+        except sqlite3.IntegrityError:
+            pass  # already linked
+
+    def get_sessions(
+        self,
+        project_id: int | None = None,
+        limit: int = 200,
+    ) -> list[WorkSessionRow]:
+        """Get work sessions, optionally filtered by project."""
+        if project_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM work_sessions WHERE project_id = ? ORDER BY session_start DESC LIMIT ?",
+                (project_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM work_sessions ORDER BY session_start DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [WorkSessionRow(**dict(r)) for r in rows]
+
+    def get_session_events(self, session_id: int) -> list[SessionEventRow]:
+        """Get all event links for a session."""
+        rows = self.conn.execute(
+            "SELECT * FROM session_events WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        return [SessionEventRow(**dict(r)) for r in rows]
+
+    def get_unanalyzed_sessions(
+        self,
+        project_id: int,
+        limit: int = 500,
+    ) -> list[WorkSessionRow]:
+        """Get sessions that haven't been analyzed yet."""
+        rows = self.conn.execute(
+            "SELECT * FROM work_sessions WHERE project_id = ? AND analysis_run_id IS NULL ORDER BY session_start LIMIT ?",
+            (project_id, limit),
+        ).fetchall()
+        return [WorkSessionRow(**dict(r)) for r in rows]
+
+    def update_session_analysis(
+        self,
+        session_id: int,
+        llm_summary: str,
+        llm_intent: str,
+        significance: float,
+        analysis_run_id: int,
+    ) -> None:
+        """Update a session with LLM analysis results."""
+        self.conn.execute(
+            """UPDATE work_sessions
+               SET llm_summary = ?, llm_intent = ?, significance = ?, analysis_run_id = ?
+               WHERE id = ?""",
+            (llm_summary, llm_intent, significance, analysis_run_id, session_id),
+        )
+
+    def backfill_event(
+        self,
+        source_id: str,
+        diff_summary: str | None = None,
+        change_types: str | None = None,
+    ) -> bool:
+        """Update enrichment columns for an existing event by source_id. Returns True if updated."""
+        updates: list[str] = []
+        params: list[str] = []
+        if diff_summary is not None:
+            updates.append("diff_summary = ?")
+            params.append(diff_summary)
+        if change_types is not None:
+            updates.append("change_types = ?")
+            params.append(change_types)
+        if not updates:
+            return False
+        params.append(source_id)
+        cursor = self.conn.execute(
+            f"UPDATE events SET {', '.join(updates)} WHERE source_id = ?",
+            params,
+        )
+        return cursor.rowcount > 0
+
+    def set_event_session(self, event_id: int, session_id: int) -> None:
+        """Set the session_id on an event."""
+        self.conn.execute(
+            "UPDATE events SET session_id = ? WHERE id = ?",
+            (session_id, event_id),
+        )
 
     # --- Concept link operations ---
 
@@ -795,4 +966,6 @@ class TrajectoryDB:
             raw_data=json.dumps(extracted.raw_data) if extracted.raw_data else None,
             files_changed=json.dumps(extracted.files_changed) if extracted.files_changed else None,
             git_branch=extracted.git_branch,
+            diff_summary=extracted.diff_summary,
+            change_types=json.dumps(extracted.change_types) if extracted.change_types else None,
         )

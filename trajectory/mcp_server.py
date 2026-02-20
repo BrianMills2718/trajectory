@@ -4,13 +4,7 @@
 import json
 import logging
 import sys
-from pathlib import Path
 from typing import Optional
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-_llm_client_path = str(Path.home() / "projects" / "llm_client")
-if _llm_client_path not in sys.path:
-    sys.path.insert(0, _llm_client_path)
 
 from mcp.server.fastmcp import FastMCP
 

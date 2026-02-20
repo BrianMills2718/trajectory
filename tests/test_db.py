@@ -181,3 +181,141 @@ class TestInsertCorrection:
         ).fetchone()
         assert row["correction_type"] == "rename"
         assert row["old_value"] == "old_name"
+
+
+class TestWorkSessions:
+    def test_insert_and_get(self, tmp_db):
+        db = tmp_db
+        pid = db.upsert_project("proj", "/tmp/proj")
+        sid = db.insert_work_session(
+            project_id=pid,
+            session_start="2026-01-15T10:00:00",
+            session_end="2026-01-15T11:00:00",
+            user_goal="Fix timeout bug",
+            commit_hashes='["abc1234"]',
+        )
+        assert sid > 0
+
+        sessions = db.get_sessions(project_id=pid)
+        assert len(sessions) == 1
+        assert sessions[0].user_goal == "Fix timeout bug"
+
+    def test_insert_session_event(self, tmp_db):
+        db = tmp_db
+        pid = db.upsert_project("proj", "/tmp/proj")
+        eid = db.insert_event(EventInsert(
+            project_id=pid, event_type=EventType.COMMIT,
+            source_id="git:aaa", timestamp="2026-01-15T10:00:00",
+            author="brian", title="Test commit",
+        ))
+        sid = db.insert_work_session(
+            project_id=pid,
+            session_start="2026-01-15T10:00:00",
+            session_end="2026-01-15T11:00:00",
+        )
+        db.insert_session_event(sid, eid, "commit")
+        events = db.get_session_events(sid)
+        assert len(events) == 1
+        assert events[0].role == "commit"
+
+    def test_session_event_dedup(self, tmp_db):
+        db = tmp_db
+        pid = db.upsert_project("proj", "/tmp/proj")
+        eid = db.insert_event(EventInsert(
+            project_id=pid, event_type=EventType.COMMIT,
+            source_id="git:aaa", timestamp="2026-01-15T10:00:00",
+            author="brian", title="Test commit",
+        ))
+        sid = db.insert_work_session(
+            project_id=pid,
+            session_start="2026-01-15T10:00:00",
+            session_end="2026-01-15T11:00:00",
+        )
+        db.insert_session_event(sid, eid, "commit")
+        db.insert_session_event(sid, eid, "commit")  # duplicate — should not raise
+        events = db.get_session_events(sid)
+        assert len(events) == 1
+
+    def test_unanalyzed_sessions(self, tmp_db):
+        db = tmp_db
+        pid = db.upsert_project("proj", "/tmp/proj")
+        db.insert_work_session(
+            project_id=pid,
+            session_start="2026-01-15T10:00:00",
+            session_end="2026-01-15T11:00:00",
+        )
+        unanalyzed = db.get_unanalyzed_sessions(pid)
+        assert len(unanalyzed) == 1
+
+    def test_update_session_analysis(self, tmp_db):
+        db = tmp_db
+        pid = db.upsert_project("proj", "/tmp/proj")
+        sid = db.insert_work_session(
+            project_id=pid,
+            session_start="2026-01-15T10:00:00",
+            session_end="2026-01-15T11:00:00",
+        )
+        run_id = db.create_analysis_run(
+            model="test", prompt_version="v1", project_id=pid,
+            started_at="2026-01-15T12:00:00",
+        )
+        db.update_session_analysis(sid, "Summary", "feature", 0.8, run_id)
+        db.conn.commit()
+
+        unanalyzed = db.get_unanalyzed_sessions(pid)
+        assert len(unanalyzed) == 0
+
+        sessions = db.get_sessions(project_id=pid)
+        assert sessions[0].llm_summary == "Summary"
+        assert sessions[0].significance == 0.8
+
+
+class TestBackfillEvent:
+    def test_backfill_updates_existing(self, tmp_db):
+        db = tmp_db
+        pid = db.upsert_project("proj", "/tmp/proj")
+        db.insert_event(EventInsert(
+            project_id=pid, event_type=EventType.COMMIT,
+            source_id="git:abc123", timestamp="2026-01-15T10:00:00",
+            author="brian", title="Test commit",
+        ))
+        updated = db.backfill_event(
+            "git:abc123",
+            diff_summary="  MODIFY foo.py (+5/-2)",
+            change_types='{"foo.py": "MODIFY"}',
+        )
+        assert updated is True
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT diff_summary, change_types FROM events WHERE source_id = 'git:abc123'"
+        ).fetchone()
+        assert row["diff_summary"] == "  MODIFY foo.py (+5/-2)"
+        assert row["change_types"] == '{"foo.py": "MODIFY"}'
+
+    def test_backfill_nonexistent_returns_false(self, tmp_db):
+        updated = tmp_db.backfill_event("git:nonexistent", diff_summary="x")
+        assert updated is False
+
+
+class TestSetEventSession:
+    def test_sets_session_id(self, tmp_db):
+        db = tmp_db
+        pid = db.upsert_project("proj", "/tmp/proj")
+        eid = db.insert_event(EventInsert(
+            project_id=pid, event_type=EventType.COMMIT,
+            source_id="git:aaa", timestamp="2026-01-15T10:00:00",
+            author="brian", title="Test",
+        ))
+        sid = db.insert_work_session(
+            project_id=pid,
+            session_start="2026-01-15T10:00:00",
+            session_end="2026-01-15T11:00:00",
+        )
+        db.set_event_session(eid, sid)
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT session_id FROM events WHERE id = ?", (eid,)
+        ).fetchone()
+        assert row["session_id"] == sid

@@ -39,39 +39,6 @@ class ConceptStatus(str, Enum):
     MERGED = "merged"
 
 
-class ConceptRelationship(str, Enum):
-    INTRODUCES = "introduces"
-    DEVELOPS = "develops"
-    REFACTORS = "refactors"
-    ABANDONS = "abandons"
-    COMPLETES = "completes"
-    REFERENCES = "references"
-
-
-class ConceptLinkType(str, Enum):
-    DEPENDS_ON = "depends_on"
-    EVOLVED_FROM = "evolved_from"
-    REPLACED_BY = "replaced_by"
-    RELATED_TO = "related_to"
-    SPAWNED = "spawned"
-
-
-class CorrectionType(str, Enum):
-    RENAME = "rename"
-    MERGE = "merge"
-    SPLIT = "split"
-    STATUS_CHANGE = "status_change"
-    RECLASSIFY = "reclassify"
-
-
-class DecisionType(str, Enum):
-    ARCHITECTURAL = "architectural"
-    TOOLING = "tooling"
-    PATTERN = "pattern"
-    TECHNOLOGY = "technology"
-    PROCESS = "process"
-
-
 # --- Row models (what comes out of the DB) ---
 
 
@@ -103,6 +70,9 @@ class EventRow(BaseModel):
     llm_intent: str | None = None
     significance: float | None = None
     analysis_run_id: int | None = None
+    diff_summary: str | None = None
+    change_types: str | None = None
+    session_id: int | None = None
     created_at: str
 
 
@@ -136,6 +106,8 @@ class EventInsert(BaseModel):
     raw_data: str | None = None
     files_changed: str | None = None
     git_branch: str | None = None
+    diff_summary: str | None = None
+    change_types: str | None = None
 
 
 # --- Extractor output models ---
@@ -173,17 +145,6 @@ class ConceptLinkRow(BaseModel):
     evidence: str | None = None
 
 
-class CorrectionRow(BaseModel):
-    id: int
-    correction_type: str
-    target_type: str
-    target_id: int
-    old_value: str | None = None
-    new_value: str | None = None
-    source_command: str | None = None
-    created_at: str
-
-
 class QueryResult(BaseModel):
     answer: str
     concepts_found: list[str]
@@ -206,3 +167,43 @@ class ExtractedEvent(BaseModel):
     raw_data: dict[str, Any] | None = None
     files_changed: list[str] | None = None
     git_branch: str | None = None
+    diff_summary: str | None = None
+    change_types: dict[str, str] | None = None
+
+
+# --- Work session models ---
+
+
+class WorkSessionRow(BaseModel):
+    """A work session from the DB — a conversation + its commits."""
+    id: int
+    project_id: int
+    conversation_event_id: int | None = None
+    session_start: str
+    session_end: str
+    user_goal: str | None = None
+    tool_sequence: str | None = None  # JSON
+    files_modified: str | None = None  # JSON
+    commit_hashes: str | None = None  # JSON
+    assistant_reasoning: str | None = None
+    diff_summary: str | None = None
+    llm_summary: str | None = None
+    llm_intent: str | None = None
+    significance: float | None = None
+    analysis_run_id: int | None = None
+    created_at: str
+
+
+class SessionEventRow(BaseModel):
+    """Link between a work session and an event."""
+    id: int
+    session_id: int
+    event_id: int
+    role: str  # 'conversation' or 'commit'
+
+
+class SessionAnalysis(BaseModel):
+    """LLM analysis result for a work session."""
+    summary: str
+    intent: str
+    significance: float

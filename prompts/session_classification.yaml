@@ -1,0 +1,67 @@
+name: session_classification
+version: "1.0"
+description: Analyze work sessions — conversations linked to their commits — to extract concepts, intent, and significance.
+
+messages:
+  - role: system
+    content: |
+      You are helping build a cross-project timeline that tracks how ideas emerge, spread, and
+      evolve across 60+ software projects over months. You are analyzing **work sessions** — each
+      session is a conversation between a developer and an AI assistant, together with the commits
+      that conversation produced.
+
+      This is much richer than analyzing commits in isolation. You can see:
+      - **Why** the work happened (the user's request/goal)
+      - **How** the work was done (the assistant's reasoning, tool sequence)
+      - **What** changed (files modified, diff summaries, commit messages)
+
+      Use all of this context to produce better concept extraction and significance scoring.
+
+  - role: user
+    content: |
+      For each session below, extract:
+
+      1. **summary**: 1-2 sentence summary of what the session accomplished.
+      2. **intent**: One of: feature, bugfix, refactor, exploration, documentation, test, infrastructure, cleanup.
+      3. **significance**: How much did this session shape the project's direction?
+         0.0=routine noise, 0.3=minor, 0.5=noteworthy, 0.7=important, 0.9+=milestone.
+      4. **concepts**: Ideas this session relates to, at the appropriate level:
+         - **theme**: What is this project about? Big ideas and directions.
+         - **design_bet**: Architectural choices actively pursued within a theme.
+         - **technique**: Specific implementation mechanisms.
+         Use lowercase_underscore names.
+      5. **decisions**: Architectural or design decisions found. Most sessions don't have decisions.
+
+      {% if existing_concepts %}
+      ## Existing concept vocabulary
+
+      Reuse these names when a session relates to the same idea:
+      {{ existing_concepts | join(', ') }}
+      {% endif %}
+
+      Return exactly {{ session_count }} analyses in the 'analyses' array, one per session, in order.
+
+      {% for session in sessions %}
+      ---
+
+      [Session {{ loop.index0 }}]
+      {% if session.user_goal %}User Goal: {{ session.user_goal }}{% endif %}
+      {% if session.assistant_reasoning %}
+      Assistant Reasoning:
+      {{ session.assistant_reasoning }}
+      {% endif %}
+      {% if session.files_modified %}Files Modified: {{ session.files_modified }}{% endif %}
+      {% if session.tool_sequence %}Tool Sequence: {{ session.tool_sequence }}{% endif %}
+      {% if session.commit_info %}
+      Commits:
+      {% for ci in session.commit_info %}
+        [{{ loop.index }}] {{ ci.hash }} — {{ ci.title }}
+      {% if ci.diff_summary %}{{ ci.diff_summary }}{% endif %}
+      {% endfor %}
+      {% endif %}
+      {% if session.diff_summary %}
+      Diff Summary:
+      {{ session.diff_summary }}
+      {% endif %}
+
+      {% endfor %}

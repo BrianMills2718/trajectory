@@ -1,0 +1,72 @@
+name: event_classification
+version: "3.1"
+description: Analyze individual events (commits, docs, archives) to extract concepts, intent, and significance.
+
+messages:
+  - role: system
+    content: |
+      You are helping build a cross-project timeline that tracks how ideas emerge, spread, and
+      evolve across 60+ software projects over months. This data feeds three downstream uses:
+
+      1. **Cross-project linking**: Concepts get matched across repositories to show how an idea
+         spread from one project to others.
+      2. **Timeline narrative**: Concepts cluster events into coherent storylines.
+      3. **Query answering**: Users search for concepts by keyword to find relevant events.
+
+      Think about it this way: if someone asked "what is this project about and where is it headed?",
+      the concepts you extract should be the ideas you'd mention. They're the design bets,
+      architectural choices, and recurring themes — not the implementation details of individual commits.
+
+  - role: user
+    content: |
+      For each event below, extract:
+
+      1. **summary**: 1-2 sentence summary of what happened.
+      2. **intent**: One of: feature, bugfix, refactor, exploration, documentation, test, infrastructure, cleanup.
+      3. **significance**: How much did this event shape the project's direction?
+         0.0=routine noise, 0.3=minor, 0.5=noteworthy, 0.7=important, 0.9+=milestone.
+      4. **concepts**: Ideas this event relates to, at the appropriate level of abstraction:
+         - **theme**: What is this project about? The big ideas and directions.
+           Examples: "knowledge_graph", "agent_architecture", "osint", "epistemic_reasoning"
+         - **design_bet**: Architectural choices actively pursued within a theme.
+           Examples: "langgraph_backend", "spec_driven_generation", "owl_dl_translation"
+         - **technique**: Specific implementation mechanisms.
+           Examples: "bfs_detection", "fan_out_fix", "pagerank_scoring"
+
+         Not every event has concepts at every level. Use lowercase_underscore names.
+         If a concept doesn't fit any of the three levels, use a different label and explain
+         why in level_rationale.
+      5. **decisions**: Architectural or design decisions found. Most events don't have decisions.
+
+      {% if existing_concepts %}
+      ## Existing concept vocabulary
+
+      Reuse these names when an event relates to the same idea:
+      {{ existing_concepts | join(', ') }}
+      {% endif %}
+
+      Return exactly {{ event_count }} analyses in the 'analyses' array, one per event, in order.
+
+      Events:
+
+      {% for event in events %}
+      ---
+
+      [Event {{ loop.index0 }}]
+      Type: {{ event.event_type }}
+      Timestamp: {{ event.timestamp }}
+      Title: {{ event.title }}
+      {% if event.author %}Author: {{ event.author }}{% endif %}
+      {% if event.git_branch %}Branch: {{ event.git_branch }}{% endif %}
+      {% if event.diff_summary %}
+      Diff Summary:
+      {{ event.diff_summary }}
+      {% endif %}
+      {% if event.change_types %}Change Types: {{ event.change_types }}{% endif %}
+      {% if event.files_changed %}Files changed: {{ event.files_changed }}{% endif %}
+      {% if event.body %}
+      Body:
+      {{ event.body }}
+      {% endif %}
+
+      {% endfor %}
