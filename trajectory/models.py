@@ -164,6 +164,15 @@ class DecisionRow(BaseModel):
     created_at: str
 
 
+class ConceptLinkRow(BaseModel):
+    id: int
+    concept_a_id: int
+    concept_b_id: int
+    relationship: str
+    strength: float
+    evidence: str | None = None
+
+
 class CorrectionRow(BaseModel):
     id: int
     correction_type: str

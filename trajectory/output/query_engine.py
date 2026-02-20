@@ -272,6 +272,46 @@ def list_concepts(
     return result
 
 
+def get_concept_links(
+    db: TrajectoryDB,
+    concept_name: str | None = None,
+    relationship: str | None = None,
+    min_strength: float | None = None,
+) -> list[dict[str, object]]:
+    """Get concept links with resolved names."""
+    concept_id: int | None = None
+    if concept_name:
+        c = db.get_concept_by_name(concept_name)
+        if not c:
+            raise ValueError(f"Concept not found: {concept_name}")
+        concept_id = c.id
+
+    links = db.get_concept_links(
+        concept_id=concept_id,
+        relationship=relationship,
+        min_strength=min_strength,
+    )
+
+    # Resolve IDs to names
+    id_to_name: dict[int, str] = {}
+    result: list[dict[str, object]] = []
+    for link in links:
+        for cid in (link.concept_a_id, link.concept_b_id):
+            if cid not in id_to_name:
+                concept = db.conn.execute(
+                    "SELECT name FROM concepts WHERE id = ?", (cid,)
+                ).fetchone()
+                id_to_name[cid] = concept["name"] if concept else f"unknown:{cid}"
+        result.append({
+            "concept_a": id_to_name[link.concept_a_id],
+            "concept_b": id_to_name[link.concept_b_id],
+            "relationship": link.relationship,
+            "strength": link.strength,
+            "evidence": link.evidence,
+        })
+    return result
+
+
 def correct_concept(
     concept_name: str,
     action: str,

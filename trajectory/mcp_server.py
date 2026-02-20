@@ -117,6 +117,25 @@ def ingest_project(project_path: str) -> str:
 
 
 @mcp.tool()
+def get_concept_links(
+    concept_name: Optional[str] = None,
+    relationship: Optional[str] = None,
+    min_strength: Optional[float] = None,
+) -> str:
+    """Get cross-project concept links. Optionally filter by concept name, relationship type, or minimum strength."""
+    try:
+        result = qe.get_concept_links(
+            _get_db(),
+            concept_name=concept_name,
+            relationship=relationship,
+            min_strength=min_strength,
+        )
+        return json.dumps(result, default=str)
+    except (ValueError, FileNotFoundError) as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 def correct_concept(
     concept_name: str,
     action: str,

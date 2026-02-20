@@ -7,6 +7,7 @@ from pathlib import Path
 
 from trajectory.config import Config
 from trajectory.models import (
+    ConceptLinkRow,
     ConceptRow,
     DecisionRow,
     EventInsert,
@@ -480,6 +481,70 @@ class TrajectoryDB:
             (event_id, project_id, title, reasoning, alternatives, decision_type, analysis_run_id),
         )
         return cursor.lastrowid  # type: ignore[return-value]
+
+    # --- Concept link operations ---
+
+    def upsert_concept_link(
+        self,
+        concept_a_id: int,
+        concept_b_id: int,
+        relationship: str,
+        strength: float = 0.5,
+        evidence: str | None = None,
+    ) -> int:
+        """Insert or update a concept link. Returns link ID."""
+        try:
+            cursor = self.conn.execute(
+                """INSERT INTO concept_links (concept_a_id, concept_b_id, relationship, strength, evidence)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (concept_a_id, concept_b_id, relationship, strength, evidence),
+            )
+            return cursor.lastrowid  # type: ignore[return-value]
+        except sqlite3.IntegrityError:
+            # Already exists — update strength and evidence
+            self.conn.execute(
+                """UPDATE concept_links SET strength = ?, evidence = ?
+                   WHERE concept_a_id = ? AND concept_b_id = ? AND relationship = ?""",
+                (strength, evidence, concept_a_id, concept_b_id, relationship),
+            )
+            row = self.conn.execute(
+                """SELECT id FROM concept_links
+                   WHERE concept_a_id = ? AND concept_b_id = ? AND relationship = ?""",
+                (concept_a_id, concept_b_id, relationship),
+            ).fetchone()
+            return row["id"]
+
+    def delete_all_concept_links(self) -> int:
+        """Delete all concept links. Returns count deleted."""
+        count = self.conn.execute("SELECT COUNT(*) as cnt FROM concept_links").fetchone()["cnt"]
+        self.conn.execute("DELETE FROM concept_links")
+        self.conn.commit()
+        return count
+
+    def get_concept_links(
+        self,
+        concept_id: int | None = None,
+        relationship: str | None = None,
+        min_strength: float | None = None,
+    ) -> list[ConceptLinkRow]:
+        """Get concept links with optional filters."""
+        clauses: list[str] = []
+        params: list[int | str | float] = []
+        if concept_id is not None:
+            clauses.append("(concept_a_id = ? OR concept_b_id = ?)")
+            params.extend([concept_id, concept_id])
+        if relationship is not None:
+            clauses.append("relationship = ?")
+            params.append(relationship)
+        if min_strength is not None:
+            clauses.append("strength >= ?")
+            params.append(min_strength)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM concept_links {where} ORDER BY strength DESC",
+            params,
+        ).fetchall()
+        return [ConceptLinkRow(**dict(r)) for r in rows]
 
     # --- Query operations ---
 

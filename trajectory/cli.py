@@ -5,6 +5,7 @@ import logging
 import sys
 from pathlib import Path
 
+from trajectory.analysis.concept_linker import link_concepts
 from trajectory.analysis.event_classifier import analyze_project
 from trajectory.config import load_config
 from trajectory.db import TrajectoryDB
@@ -37,6 +38,10 @@ def main() -> None:
     query_parser = sub.add_parser("query", help="Ask about project evolution")
     query_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     query_parser.add_argument("question", help="Natural language question")
+
+    # link command
+    link_parser = sub.add_parser("link", help="Find cross-project concept links")
+    link_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
 
     # stats command
     stats_parser = sub.add_parser("stats", help="Show ingestion stats")
@@ -80,6 +85,29 @@ def main() -> None:
                 print(f"\nConcepts ({len(rows)}):")
                 for r in rows:
                     print(f"  {r['name']} (first: {r['first_seen'][:10] if r['first_seen'] else '?'}, last: {r['last_seen'][:10] if r['last_seen'] else '?'})")
+
+        elif args.command == "link":
+            result = link_concepts(db, config)
+            print(result)
+            # Print links
+            links = db.get_concept_links()
+            if links:
+                # Resolve names
+                id_to_name: dict[int, str] = {}
+                for link in links:
+                    for cid in (link.concept_a_id, link.concept_b_id):
+                        if cid not in id_to_name:
+                            row = db.conn.execute(
+                                "SELECT name FROM concepts WHERE id = ?", (cid,)
+                            ).fetchone()
+                            id_to_name[cid] = row["name"] if row else f"?{cid}"
+                print(f"\nLinks ({len(links)}):")
+                for link in links:
+                    a = id_to_name[link.concept_a_id]
+                    b = id_to_name[link.concept_b_id]
+                    print(f"  {a} --[{link.relationship} {link.strength:.1f}]--> {b}")
+                    if link.evidence:
+                        print(f"    {link.evidence}")
 
         elif args.command == "query":
             from trajectory.output.query_engine import query_trajectory

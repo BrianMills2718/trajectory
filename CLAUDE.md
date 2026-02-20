@@ -4,7 +4,7 @@
 
 Project trajectory tracker — tracks how ideas emerge, evolve, and spread across Brian's 60+ projects. Ingests git commits, Claude Code conversation logs, and documentation into SQLite, then uses LLM analysis to extract concepts, significance scores, decisions, and intent from each event. Exposed as an MCP server for both Claude Code and OpenClaw/moltbot.
 
-## Current State (2026-02-17)
+## Current State (2026-02-19)
 
 ### What's Built and Working (Phase 1 + Phase 2 + Phase 3)
 
@@ -16,7 +16,7 @@ Project trajectory tracker — tracks how ideas emerge, evolve, and spread acros
 - `trajectory/extractors/claude_log_extractor.py` — JSONL parser for Claude Code logs with smart log dir matching (handles path aliases)
 - `trajectory/extractors/doc_extractor.py` — Extracts from CLAUDE.md, STATUS.md, archive dirs, docs/archive dirs
 - `trajectory/ingest.py` — Orchestrator that runs all 3 extractors with dedup by source_id
-- `trajectory/cli.py` — CLI with `ingest`, `analyze`, `stats`, `query` commands
+- `trajectory/cli.py` — CLI with `ingest`, `analyze`, `stats`, `query`, `link` commands
 
 **Phase 2: LLM Analysis** — COMPLETE
 - `trajectory/analysis/event_classifier.py` — Batches events (30 at a time), sends to LLM via `call_llm_structured()`, extracts intent, summary, concepts, significance (0.0-1.0), and decisions
@@ -26,8 +26,8 @@ Project trajectory tracker — tracks how ideas emerge, evolve, and spread acros
 - Results stored: events updated with llm_summary/llm_intent/significance, concepts table populated, concept_events linked, decisions stored
 
 **Phase 3: Query Engine + MCP Server** — COMPLETE
-- `trajectory/output/query_engine.py` — 7 functions: NL question → SQL retrieval → LLM synthesis, timelines, concept history, project listing, concept listing, concept corrections, project ingestion
-- `trajectory/mcp_server.py` — 7 MCP tools wrapping query engine (query_trajectory, get_timeline, get_concept_history, list_tracked_projects, list_concepts, ingest_project, correct_concept)
+- `trajectory/output/query_engine.py` — 8 functions: NL question → SQL retrieval → LLM synthesis, timelines, concept history, project listing, concept listing, concept links, concept corrections, project ingestion
+- `trajectory/mcp_server.py` — 8 MCP tools wrapping query engine (query_trajectory, get_timeline, get_concept_history, list_tracked_projects, list_concepts, get_concept_links, ingest_project, correct_concept)
 - `prompts/query_synthesis.yaml` — Jinja2 template for NL synthesis via `llm_client.render_prompt()`
 - MCP server wired into both Claude Code (`~/.config/claude-cli-nodejs/mcp.json`) and Codex CLI (`~/.codex/config.toml`)
 - Keyword-based concept search (SQL LIKE on ~100 concepts — fast, no vector DB needed)
@@ -39,10 +39,11 @@ Project trajectory tracker — tracks how ideas emerge, evolve, and spread acros
 - All 664 events analyzed by LLM
 - Concepts, decisions, significance scores all stored in SQLite
 
-**Test Suite: 46 tests passing**
+**Test Suite: 57 tests passing**
 - `tests/test_db.py` — 26 tests for DB query and correction methods
 - `tests/test_query_engine.py` — 16 tests for query engine functions (LLM calls mocked)
 - `tests/test_mcp_server.py` — 4 tests for tool registration and JSON returns
+- `tests/test_concept_linker.py` — 11 tests for concept link DB methods, query engine, and MCP tool
 
 **Multi-Level Concept Extraction (2026-02-18):**
 - Concepts now carry a `level`: theme (project identity), design_bet (architectural choice), technique (implementation mechanism)
@@ -75,12 +76,17 @@ Multi-level extraction validated across 3 diverse project types:
 
 **Verdict**: Themes are coherent across projects. Proceed to cross-project concept linking.
 
-### What's NOT Built Yet
+**Cross-Project Concept Linking (2026-02-19):**
+- `trajectory/analysis/concept_linker.py` — `link_concepts()` loads all theme-level concepts, calls LLM structured output to find cross-project links, full-replacement strategy (delete all + rewrite)
+- `prompts/concept_linking.yaml` — Goal-framed Jinja2 template: themes with project membership, event counts, dates. 5 relationship types: depends_on, evolved_from, replaced_by, related_to, spawned
+- DB methods: `upsert_concept_link()`, `delete_all_concept_links()`, `get_concept_links()` with concept/relationship/min_strength filters
+- Query engine: `get_concept_links()` resolves concept IDs to names
+- CLI: `python -m trajectory.cli link` — runs linker, prints all links with evidence
+- MCP tool: `get_concept_links(concept_name?, relationship?, min_strength?)`
+- LLM response models: `ConceptLinkFound`, `ConceptLinkingResult`
+- Validation: rejects unknown concept names, self-links, invalid relationship types
 
-**Next: Cross-project concept linking** (activate concept_links table)
-- Match themes across repos to show idea lineage (e.g., knowledge_graph spreading from one project to others)
-- Level filter makes this tractable: match on themes, ignore technique-level noise
-- Gate passed — ready to implement
+### What's NOT Built Yet
 
 **Phase 3 Remaining:**
 - Digest generation for daily/weekly summaries (deferred)
@@ -109,13 +115,15 @@ trajectory/
 │   │   └── doc_extractor.py       # CLAUDE.md/STATUS.md/archive parser
 │   ├── analysis/
 │   │   ├── __init__.py            # Adds llm_client to sys.path
-│   │   └── event_classifier.py    # LLM batch classification
+│   │   ├── event_classifier.py    # LLM batch classification
+│   │   └── concept_linker.py      # Cross-project concept linking
 │   └── output/
 │       └── query_engine.py        # NL query → SQL → LLM synthesis
 ├── data/
 │   └── trajectory.db              # SQLite database (gitignored)
 ├── prompts/
-│   └── query_synthesis.yaml       # Jinja2 template for query synthesis
+│   ├── query_synthesis.yaml       # Jinja2 template for query synthesis
+│   └── concept_linking.yaml       # Jinja2 template for concept linking
 ├── templates/                     # Empty — for D3.js HTML later
 └── tests/
     ├── conftest.py                # Shared fixtures (tmp_db, populated_db)
@@ -162,6 +170,9 @@ python -m trajectory.cli ingest
 # Run LLM analysis on ingested events
 python -m trajectory.cli analyze /home/brian/projects/sam_gov
 
+# Find cross-project concept links (LLM-powered, theme-level only)
+python -m trajectory.cli link
+
 # Ask about project evolution (NL query → LLM synthesis)
 python -m trajectory.cli query "How has the ontology idea evolved?"
 
@@ -174,7 +185,7 @@ python -m pytest tests/ -v
 
 ## MCP Server
 
-7 tools available via both Claude Code and Codex CLI:
+8 tools available via both Claude Code and Codex CLI:
 
 | Tool | Purpose |
 |------|---------|
@@ -183,6 +194,7 @@ python -m pytest tests/ -v
 | `get_concept_history` | Full history of a concept across all projects |
 | `list_tracked_projects` | All projects with event counts and analysis status |
 | `list_concepts` | Concepts with optional status/project/level filters |
+| `get_concept_links` | Cross-project concept links with optional concept/relationship/strength filters |
 | `ingest_project` | Ingest events from a project directory |
 | `correct_concept` | Rename, merge, or change status of a concept |
 

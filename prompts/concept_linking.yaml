@@ -1,0 +1,40 @@
+name: concept_linking
+version: "1.0"
+description: Identify cross-project links between theme-level concepts.
+
+messages:
+  - role: system
+    content: |
+      You are building a graph of how ideas connect and evolve across a developer's 60+ projects.
+      Your job is to identify meaningful relationships between theme-level concepts that span
+      different projects. These links will power queries like "how did the knowledge_graph idea
+      spread?" and "what depends on llm_client?"
+
+      Only link concepts when there is a genuine intellectual or architectural relationship.
+      Not every concept needs links. Avoid linking concepts just because they coexist in the
+      same project — that's proximity, not relationship.
+
+  - role: user
+    content: |
+      ## Theme-Level Concepts
+
+      {% for t in themes %}
+      - **{{ t.name }}** ({{ t.status }}) — projects: {{ t.projects | join(', ') }}. {{ t.event_count }} events, first seen {{ t.first_seen or 'unknown' }}, last seen {{ t.last_seen or 'unknown' }}.{% if t.description %} {{ t.description }}{% endif %}
+
+      {% endfor %}
+
+      ## Relationship Types
+
+      - **depends_on**: A cannot work without B (e.g., mcp_server depends_on structured_output)
+      - **evolved_from**: A is a more mature version of B (e.g., agent_architecture evolved_from chatbot_prototype)
+      - **replaced_by**: A was abandoned in favor of B (e.g., raw_api_calls replaced_by llm_client)
+      - **related_to**: A and B share intellectual DNA but neither depends on the other
+      - **spawned**: A was created as a spin-off from B (e.g., llm_client spawned from sam_gov)
+
+      Find cross-project concept links. For each link, provide:
+      - The two concept names (must be exact names from the list above)
+      - The relationship type (one of the five above)
+      - Strength (0.0-1.0): how strong is this relationship?
+      - Evidence: one sentence explaining why this link exists
+
+      Return only links you are confident about. Quality over quantity.
