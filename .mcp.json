@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "trajectory": {
+      "command": "/home/brian/projects/trajectory/.venv/bin/python",
+      "args": ["-m", "trajectory.mcp_server"],
+      "env": {
+        "PYTHONPATH": "/home/brian/projects/trajectory"
+      }
+    }
+  }
+}
