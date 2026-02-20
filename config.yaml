@@ -40,3 +40,16 @@ digest:
   significance_threshold: 0.5
   daily_max_events: 50
   weekly_max_events: 200
+
+# Mural visualization (Phase 4)
+# X=time (months), Y=conceptual space (themes positioned by PCA of sub-concepts)
+mural:
+  tile_size: 1024
+  vertical_overlap: 0.35  # fraction of tile height overlapping between adjacent rows
+  quality: medium
+  style_suffix: "digital art mural, dark background with glowing nodes and flowing connections, technical but beautiful, cohesive palette"
+  prompt_model: gemini/gemini-2.5-flash-lite
+  image_model: gpt-image-1
+  max_cost: 2.00
+  max_projects: 6
+  max_months: 4

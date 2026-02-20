@@ -65,6 +65,22 @@ def main() -> None:
     stats_parser = sub.add_parser("stats", help="Show ingestion stats")
     stats_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
 
+    # mural command
+    mural_parser = sub.add_parser("mural", help="Generate AI art mural from trajectory data")
+    mural_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    mural_parser.add_argument(
+        "--themes", type=str, default=None,
+        help="Comma-separated theme names (auto-selects if omitted)",
+    )
+    mural_parser.add_argument(
+        "--months", type=str, default=None,
+        help="Comma-separated YYYY-MM months (auto-selects if omitted)",
+    )
+    mural_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show layout and prompts without generating images",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -165,6 +181,21 @@ def main() -> None:
                     f"({p.total_commits} commits, {p.total_conversations} conversations), "
                     f"last ingested: {p.last_ingested}"
                 )
+
+        elif args.command == "mural":
+            from trajectory.output.mural import generate_mural
+
+            theme_list = args.themes.split(",") if args.themes else None
+            month_list = args.months.split(",") if args.months else None
+
+            result = generate_mural(
+                db, config,
+                themes=theme_list,
+                months=month_list,
+                dry_run=args.dry_run,
+            )
+            if not args.dry_run:
+                print(f"Output: {result.output_dir}")
 
         else:
             parser.print_help()

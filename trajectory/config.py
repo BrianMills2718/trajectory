@@ -33,6 +33,21 @@ class DigestConfig(BaseModel):
     weekly_max_events: int = 200
 
 
+class MuralConfig(BaseModel):
+    tile_size: int = 1024
+    vertical_overlap: float = 0.35  # fraction of tile_size overlapping between adjacent rows
+    quality: str = "medium"
+    style_suffix: str = (
+        "digital art mural, dark background with glowing nodes and flowing connections, "
+        "technical but beautiful, cohesive palette"
+    )
+    prompt_model: str = "gemini/gemini-2.5-flash-lite"
+    image_model: str = "gpt-image-1"
+    max_cost: float = 2.00
+    max_projects: int = 6
+    max_months: int = 4
+
+
 class Config(BaseModel):
     db_path: str = "data/trajectory.db"
     projects_dir: str = "/home/brian/projects"
@@ -40,6 +55,7 @@ class Config(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     digest: DigestConfig = Field(default_factory=DigestConfig)
+    mural: MuralConfig = Field(default_factory=MuralConfig)
 
     @property
     def resolved_db_path(self) -> Path:

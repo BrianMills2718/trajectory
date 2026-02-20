@@ -92,12 +92,24 @@ Multi-level extraction validated across 3 diverse project types:
 - LLM response models: `ConceptLinkFound`, `ConceptLinkingResult`
 - Validation: rejects unknown concept names, self-links, invalid relationship types
 
+**Phase 4: Mural Visualization** — IN PROGRESS
+- `trajectory/output/mural.py` — AI art mural generator. Tiles = themes (not projects). X-axis = time (months), Y-axis = conceptual space via PCA on sub-concepts (techniques + design_bets) with TF-IDF weighting. Alpha-blended edges for seamless compositing.
+- `prompts/mural_tile.yaml` — Jinja2 template converting theme data into art prompts. Metaphorical imagery, no project names or code references.
+- `MuralConfig` in config.py — tile_size, vertical_overlap, style_suffix, prompt_model, image_model, max_cost
+- Image generation via OpenAI `gpt-image-1` (direct, not proxied through OpenRouter)
+- Prompt generation via `gemini/gemini-2.5-flash-lite` through `llm_client`
+- CLI: `python -m trajectory.cli mural [--themes ...] [--months ...] [--dry-run]`
+- Proof of concept: 3-tile mural (graph_rag, prompt_templates, theory_extraction) with working alpha blending
+- Dependencies: Pillow, numpy, openai
+
 ### What's NOT Built Yet
 
 **Phase 3 Remaining:**
 - Digest generation for daily/weekly summaries (deferred)
 
-**Phase 4: Visualization + Narrative Export**
+**Phase 4 Remaining:**
+- Configurable timescale (weeks/quarters, not just months)
+- 2D conceptual mural (no time axis — both axes from PCA/UMAP)
 - `trajectory/output/html_timeline.py` — D3.js interactive timeline
 - `trajectory/output/markdown_exporter.py` — Narrative markdown reports
 
@@ -112,8 +124,8 @@ trajectory/
 │   ├── models.py                  # All Pydantic models
 │   ├── db.py                      # TrajectoryDB class — SQLite wrapper with all operations
 │   ├── ingest.py                  # Orchestrator: runs extractors, dedup, stores events
-│   ├── cli.py                     # CLI: ingest, analyze, stats, query
-│   ├── mcp_server.py              # MCP server — 7 tools
+│   ├── cli.py                     # CLI: ingest, analyze, stats, query, mural
+│   ├── mcp_server.py              # MCP server — 8 tools
 │   ├── extractors/
 │   │   ├── base.py                # BaseExtractor ABC
 │   │   ├── git_extractor.py       # PyDriller commit extraction + diff summaries
@@ -125,14 +137,16 @@ trajectory/
 │   │   ├── event_classifier.py    # Session-level + event-level LLM classification
 │   │   └── concept_linker.py      # Cross-project concept linking
 │   └── output/
-│       └── query_engine.py        # NL query → SQL → LLM synthesis
+│       ├── query_engine.py        # NL query → SQL → LLM synthesis
+│       └── mural.py               # AI art mural generator (themes × months)
 ├── data/
 │   └── trajectory.db              # SQLite database (gitignored)
 ├── prompts/
 │   ├── query_synthesis.yaml       # Jinja2 template for query synthesis
 │   ├── concept_linking.yaml       # Jinja2 template for concept linking
 │   ├── session_classification.yaml # Jinja2 template for session-level analysis
-│   └── event_classification.yaml  # Jinja2 template for event-level analysis
+│   ├── event_classification.yaml  # Jinja2 template for event-level analysis
+│   └── mural_tile.yaml            # Jinja2 template for mural art prompts
 ├── templates/                     # Empty — for D3.js HTML later
 └── tests/
     ├── conftest.py                # Shared fixtures (tmp_db, populated_db)
@@ -204,6 +218,11 @@ python -m trajectory.cli query "How has the ontology idea evolved?"
 # Show stats
 python -m trajectory.cli stats
 
+# Generate AI art mural (themes × months, PCA-positioned)
+python -m trajectory.cli mural --dry-run          # preview layout + prompts
+python -m trajectory.cli mural                      # auto-select themes/months
+python -m trajectory.cli mural --themes graph_rag,prompt_templates --months 2026-02
+
 # Run tests
 python -m pytest tests/ -v
 ```
@@ -229,6 +248,7 @@ python -m pytest tests/ -v
 pip install pydriller pydantic pyyaml python-dotenv litellm instructor jinja2
 pip install -e ~/projects/llm_client
 pip install "mcp>=1.0"
+pip install Pillow numpy openai  # for mural generation
 ```
 
 ## Full Plan
