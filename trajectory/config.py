@@ -38,11 +38,11 @@ class MuralConfig(BaseModel):
     vertical_overlap: float = 0.35  # fraction of tile_size overlapping between adjacent rows
     quality: str = "medium"
     style_suffix: str = (
-        "digital art mural, dark background with glowing nodes and flowing connections, "
-        "technical but beautiful, cohesive palette"
+        "detailed illustration in the style of a fantasy world-building concept art, "
+        "rich colors, warm lighting, painterly brushwork, each scene distinct but connected"
     )
     prompt_model: str = "gemini/gemini-2.5-flash-lite"
-    image_model: str = "gpt-image-1"
+    image_model: str = "gemini-2.5-flash-image"
     max_cost: float = 2.00
     max_projects: int = 6
     max_months: int = 4

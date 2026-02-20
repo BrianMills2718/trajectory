@@ -1,22 +1,22 @@
-"""Mural generator — continuous AI art mural of the conceptual landscape.
+"""Mural generator v2 — LLM-planned layout, corner-out generation.
 
-X-axis = time (months). Y-axis = conceptual space — each tile is a
-theme, positioned by PCA of its associated techniques/bets. Themes
-with similar sub-concepts cluster together. The mural shows the
-intellectual landscape evolving over time, independent of projects.
+The LLM arranges themes into a conceptual vertical order based on their
+relationships. Tiles are generated in scanline order (top-left → right
+→ next row) so each tile's prompt can reference already-generated
+neighbors, producing a coherent flowing mural.
 """
 
-import base64
 import io
+import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
+from google import genai
 from PIL import Image, ImageDraw
 
 from llm_client import call_llm, render_prompt
-from openai import OpenAI
 
 from trajectory.config import Config, MuralConfig
 from trajectory.db import TrajectoryDB
@@ -40,18 +40,15 @@ class ThemeTile:
     design_bets: list[str]
     decisions: list[str]
     event_count: int
-    # All sub-concepts (techniques + bets) for embedding
-    sub_concepts: list[str] = field(default_factory=list)
 
 
 @dataclass
-class PlacedTile:
-    """A tile with its canvas position."""
+class GridCell:
+    """A tile placed in the grid."""
 
     data: ThemeTile
-    x: int
-    y: int
-    y_norm: float  # [0, 1]
+    row: int
+    col: int
     art_prompt: str = ""
     image: Image.Image | None = None
 
@@ -60,9 +57,11 @@ class PlacedTile:
 class MuralResult:
     """Final mural output."""
 
-    tiles: list[PlacedTile]
+    grid: list[GridCell]
     themes: list[str]
     months: list[str]
+    n_rows: int
+    n_cols: int
     canvas_size: tuple[int, int]
     output_dir: Path
     total_cost: float = 0.0
@@ -75,10 +74,7 @@ class MuralResult:
 def discover_themes(
     db: TrajectoryDB, min_events: int = 3
 ) -> list[dict[str, object]]:
-    """Find all theme-level concepts with enough activity.
-
-    Returns dicts with: id, name, event_count, month_count.
-    """
+    """Find theme-level concepts with enough activity."""
     rows = db.conn.execute(
         """SELECT c.id, c.name,
                   COUNT(DISTINCT ce.event_id) as event_count,
@@ -97,7 +93,7 @@ def discover_themes(
 
 
 def select_months_global(db: TrajectoryDB, n: int) -> list[str]:
-    """Select N contiguous months with the most analyzed theme activity."""
+    """Select N contiguous months with the most theme activity."""
     rows = db.conn.execute(
         """SELECT strftime('%Y-%m', e.timestamp) as month,
                   COUNT(DISTINCT c.id) as theme_count
@@ -135,11 +131,10 @@ def select_months_global(db: TrajectoryDB, n: int) -> list[str]:
 def query_theme_tile(
     db: TrajectoryDB, theme_id: int, theme_name: str, month: str
 ) -> ThemeTile:
-    """Get a theme's activity for one month: techniques, bets, decisions."""
+    """Get a theme's activity for one month."""
     month_start = f"{month}-01"
     month_end = f"{month}-31"
 
-    # Events for this theme in this month
     event_rows = db.conn.execute(
         """SELECT DISTINCT e.id FROM events e
            JOIN concept_events ce ON ce.event_id = e.id
@@ -147,16 +142,13 @@ def query_theme_tile(
         (theme_id, month_start, month_end),
     ).fetchall()
     event_ids = [r["id"] for r in event_rows]
-    event_count = len(event_ids)
 
     if not event_ids:
         return ThemeTile(
             theme=theme_name, month=month, activity="dormant",
-            techniques=[], design_bets=[], decisions=[],
-            event_count=0, sub_concepts=[],
+            techniques=[], design_bets=[], decisions=[], event_count=0,
         )
 
-    # Find co-occurring concepts (techniques and design_bets) on same events
     placeholders = ",".join("?" * len(event_ids))
     concept_rows = db.conn.execute(
         f"""SELECT DISTINCT c.name, c.level FROM concepts c
@@ -170,85 +162,86 @@ def query_theme_tile(
     techniques = [r["name"] for r in concept_rows if r["level"] == "technique"]
     design_bets = [r["name"] for r in concept_rows if r["level"] == "design_bet"]
 
-    # Decisions on these events
     decision_rows = db.conn.execute(
         f"""SELECT DISTINCT d.title FROM decisions d
-            WHERE d.event_id IN ({placeholders})
-            LIMIT 5""",
+            WHERE d.event_id IN ({placeholders}) LIMIT 5""",
         event_ids,
     ).fetchall()
-    decisions = [r["title"] for r in decision_rows]
 
     return ThemeTile(
-        theme=theme_name,
-        month=month,
-        activity="active",
-        techniques=techniques,
-        design_bets=design_bets,
-        decisions=decisions,
-        event_count=event_count,
-        sub_concepts=techniques + design_bets,
+        theme=theme_name, month=month, activity="active",
+        techniques=techniques, design_bets=design_bets,
+        decisions=[r["title"] for r in decision_rows],
+        event_count=len(event_ids),
     )
 
 
-# --- Conceptual Y-axis via PCA ---
+# --- LLM-planned layout ---
 
 
-def compute_y_positions(tiles: list[ThemeTile]) -> list[float]:
-    """Compute Y positions [0, 1] for each tile based on sub-concepts.
+def plan_layout(
+    theme_tiles: dict[str, ThemeTile],
+    db: TrajectoryDB,
+    config: MuralConfig,
+) -> dict[str, int]:
+    """Ask LLM to arrange themes into rows based on conceptual relationships.
 
-    Builds binary vectors from each tile's techniques + design_bets,
-    then PCA first component gives a 1D conceptual axis.
-    Tiles with no sub-concepts get y=0.5.
+    Returns {theme_name: row_index}.
     """
-    vocab: dict[str, int] = {}
-    for tile in tiles:
-        for concept in tile.sub_concepts:
-            if concept not in vocab:
-                vocab[concept] = len(vocab)
+    # Gather relationship data
+    links = db.get_concept_links()
+    id_to_name: dict[int, str] = {}
+    for link in links:
+        for cid in (link.concept_a_id, link.concept_b_id):
+            if cid not in id_to_name:
+                row = db.conn.execute(
+                    "SELECT name FROM concepts WHERE id = ?", (cid,)
+                ).fetchone()
+                id_to_name[cid] = row["name"] if row else f"?{cid}"
 
-    if not vocab:
-        return [0.5] * len(tiles)
+    link_data = []
+    theme_set = set(theme_tiles.keys())
+    for link in links:
+        a = id_to_name.get(link.concept_a_id, "")
+        b = id_to_name.get(link.concept_b_id, "")
+        # Only include links where at least one end is in our theme set
+        if a in theme_set or b in theme_set:
+            link_data.append({"a": a, "rel": link.relationship, "b": b})
 
-    n_tiles = len(tiles)
-    n_concepts = len(vocab)
-    matrix = np.zeros((n_tiles, n_concepts), dtype=np.float32)
-    for i, tile in enumerate(tiles):
-        for concept in tile.sub_concepts:
-            matrix[i, vocab[concept]] = 1.0
+    # Build theme summaries for the LLM
+    theme_summaries = []
+    for name, tile in theme_tiles.items():
+        theme_summaries.append({
+            "name": name,
+            "techniques": tile.techniques[:5],
+            "design_bets": tile.design_bets[:5],
+        })
 
-    has_concepts = matrix.sum(axis=1) > 0
+    messages = render_prompt(
+        PROMPTS_DIR / "mural_layout.yaml",
+        themes=theme_summaries,
+        theme_count=len(theme_summaries),
+        links=link_data,
+    )
 
-    if has_concepts.sum() < 2:
-        return [0.5] * n_tiles
+    result = call_llm(
+        config.prompt_model,
+        messages,
+        task="trajectory.mural.layout",
+        trace_id="trajectory.mural.layout",
+        max_budget=0,
+    )
 
-    # TF-IDF weighting: downweight concepts that appear in many tiles
-    doc_freq = (matrix > 0).sum(axis=0) + 1  # +1 smoothing
-    idf = np.log(n_tiles / doc_freq)
-    matrix = matrix * idf
+    # Parse JSON response
+    content = result.content.strip()
+    # Strip markdown code fences if present
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1]
+        if content.endswith("```"):
+            content = content[:-3]
 
-    active = matrix[has_concepts]
-    centered = active - active.mean(axis=0)
-    _, _, vt = np.linalg.svd(centered, full_matrices=False)
-    pc1 = vt[0]
-
-    projections = matrix @ pc1
-
-    active_proj = projections[has_concepts]
-    p_min = active_proj.min()
-    p_max = active_proj.max()
-
-    if p_max - p_min < 1e-8:
-        return [0.5] * n_tiles
-
-    positions: list[float] = []
-    for i in range(n_tiles):
-        if has_concepts[i]:
-            positions.append(float((projections[i] - p_min) / (p_max - p_min)))
-        else:
-            positions.append(0.5)
-
-    return positions
+    layout = json.loads(content)
+    return {item["theme"]: item["row"] for item in layout}
 
 
 # --- Prompt generation ---
@@ -257,9 +250,12 @@ def compute_y_positions(tiles: list[ThemeTile]) -> list[float]:
 def generate_tile_prompt(
     tile: ThemeTile,
     config: MuralConfig,
-    neighbor_prompts: dict[str, str] | None = None,
+    neighbors: dict[str, str] | None = None,
 ) -> str:
-    """Use LLM to convert theme tile data into an art prompt."""
+    """Use LLM to create an art prompt for this tile.
+
+    neighbors: {"above": art_prompt, "left": art_prompt} of already-generated tiles.
+    """
     messages = render_prompt(
         PROMPTS_DIR / "mural_tile.yaml",
         theme=tile.theme,
@@ -267,7 +263,7 @@ def generate_tile_prompt(
         techniques=tile.techniques[:8],
         design_bets=tile.design_bets[:8],
         decisions=tile.decisions[:5],
-        neighbor_prompts=neighbor_prompts or {},
+        neighbors=neighbors or {},
     )
 
     result = call_llm(
@@ -278,79 +274,120 @@ def generate_tile_prompt(
         max_budget=0,
     )
 
-    art_prompt = result.content.strip()
-    return f"{art_prompt} Style: {config.style_suffix}"
+    return f"{result.content.strip()} Style: {config.style_suffix}"
 
 
 # --- Image generation ---
 
 
 def generate_tile_image(
-    prompt: str, config: MuralConfig, client: OpenAI
+    prompt: str, config: MuralConfig, client: genai.Client
 ) -> Image.Image:
-    """Generate a single tile via gpt-image-1."""
-    size = f"{config.tile_size}x{config.tile_size}"
-    response = client.images.generate(
+    """Generate a single tile image via Gemini (Nano Banana)."""
+    full_prompt = (
+        f"Generate an image: {prompt} "
+        f"The image should be square, detailed, and artistic."
+    )
+    response = client.models.generate_content(
         model=config.image_model,
-        prompt=prompt,
-        n=1,
-        size=size,
-        quality=config.quality,
+        contents=[full_prompt],
     )
 
-    image_b64 = response.data[0].b64_json
-    if not image_b64:
-        raise RuntimeError("No b64_json in image response")
+    # Extract image from response — inline_data contains raw bytes
+    for part in response.parts:
+        if part.inline_data is not None:
+            img = Image.open(io.BytesIO(part.inline_data.data))
+            # Resize to tile_size if needed
+            if img.size != (config.tile_size, config.tile_size):
+                img = img.resize(
+                    (config.tile_size, config.tile_size), Image.LANCZOS
+                )
+            return img.convert("RGBA")
 
-    image_bytes = base64.b64decode(image_b64)
-    return Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    text = ""
+    for part in response.parts:
+        if part.text:
+            text = part.text[:200]
+    raise RuntimeError(f"No image in Gemini response. Text: {text}")
 
 
-# --- Alpha blending assembly ---
+# --- Assembly ---
 
 
-def create_radial_fade_mask(size: int, fade_px: int) -> Image.Image:
+def create_fade_mask(size: int, fade_px: int) -> Image.Image:
     """Create an alpha mask with gradient fade on all four edges."""
     mask = Image.new("L", (size, size), 255)
     pixels = mask.load()
 
-    for edge_offset in range(fade_px):
-        alpha = int(255 * edge_offset / fade_px)
+    for offset in range(fade_px):
+        alpha = int(255 * offset / fade_px)
         for x in range(size):
-            # Top/bottom
-            pixels[x, edge_offset] = min(alpha, pixels[x, edge_offset])
-            pixels[x, size - 1 - edge_offset] = min(alpha, pixels[x, size - 1 - edge_offset])
+            pixels[x, offset] = min(alpha, pixels[x, offset])
+            pixels[x, size - 1 - offset] = min(alpha, pixels[x, size - 1 - offset])
         for y in range(size):
-            # Left/right
-            pixels[edge_offset, y] = min(alpha, pixels[edge_offset, y])
-            pixels[size - 1 - edge_offset, y] = min(alpha, pixels[size - 1 - edge_offset, y])
+            pixels[offset, y] = min(alpha, pixels[offset, y])
+            pixels[size - 1 - offset, y] = min(alpha, pixels[size - 1 - offset, y])
 
     return mask
 
 
 def assemble_mural(
-    placed_tiles: list[PlacedTile],
-    canvas_w: int,
-    canvas_h: int,
+    grid: list[GridCell],
+    n_rows: int,
+    n_cols: int,
     tile_size: int,
-    fade_px: int,
+    overlap: int,
 ) -> Image.Image:
-    """Composite placed tiles onto canvas with alpha blending."""
-    mural = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 255))
-    mask = create_radial_fade_mask(tile_size, fade_px)
+    """Composite grid cells into a mural with alpha blending."""
+    step = tile_size - overlap
+    canvas_w = tile_size + (n_cols - 1) * step
+    canvas_h = tile_size + (n_rows - 1) * step
 
-    for pt in sorted(placed_tiles, key=lambda t: t.y):
-        if pt.image is None:
+    mural = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 255))
+    mask = create_fade_mask(tile_size, overlap)
+
+    # Composite in scanline order (same as generation order)
+    for cell in sorted(grid, key=lambda c: (c.row, c.col)):
+        if cell.image is None:
             continue
 
-        blended = pt.image.copy()
+        blended = cell.image.copy()
         blended.putalpha(mask)
 
-        x = max(0, min(pt.x, canvas_w - tile_size))
-        y = max(0, min(pt.y, canvas_h - tile_size))
+        x = cell.col * step
+        y = cell.row * step
         mural.alpha_composite(blended, (x, y))
 
-    return mural
+    return mural, canvas_w, canvas_h
+
+
+def add_timeline_bar(
+    mural: Image.Image,
+    months: list[str],
+    tile_size: int,
+    overlap: int,
+    bar_height: int = 48,
+) -> Image.Image:
+    """Add month labels across the bottom."""
+    w, h = mural.size
+    final = Image.new("RGBA", (w, h + bar_height), (0, 0, 0, 255))
+    final.paste(mural, (0, 0))
+
+    draw = ImageDraw.Draw(final)
+    draw.rectangle([(0, h), (w, h + bar_height)], fill=(15, 15, 20, 255))
+
+    step = tile_size - overlap
+    for i, month in enumerate(months):
+        cx = i * step + tile_size // 2
+        bbox = draw.textbbox((0, 0), month)
+        tw = bbox[2] - bbox[0]
+        draw.text(
+            (cx - tw // 2, h + bar_height // 2 - 6),
+            month,
+            fill=(140, 160, 180, 255),
+        )
+
+    return final
 
 
 # --- Main entry point ---
@@ -363,11 +400,7 @@ def generate_mural(
     months: list[str] | None = None,
     dry_run: bool = False,
 ) -> MuralResult:
-    """Generate a conceptual landscape mural.
-
-    Each tile = a theme in a month. Y position = PCA of sub-concepts.
-    Themes with similar techniques/bets cluster together.
-    """
+    """Generate a mural with LLM-planned layout and corner-out generation."""
     mc = config.mural
 
     # Discover themes
@@ -382,7 +415,6 @@ def generate_mural(
         theme_info = discover_themes(db, min_events=3)
         if not theme_info:
             raise ValueError("No themes with sufficient activity found")
-        # Limit to top N by activity
         theme_info = theme_info[: mc.max_projects]
 
     theme_names = [str(t["name"]) for t in theme_info]
@@ -394,143 +426,131 @@ def generate_mural(
         if not months:
             raise ValueError("No analyzed events found")
 
-    n_themes = len(theme_info)
     n_months = len(months)
 
-    # Phase 1: Query tile data for every theme × month
-    all_tiles: list[ThemeTile] = []
-    tile_month_idx: list[int] = []
+    # Query tile data for every theme × month (keep only active)
+    theme_tiles: dict[str, list[ThemeTile]] = {}  # theme -> [tiles by month]
     for ti in theme_info:
-        for mi, month in enumerate(months):
+        tiles_for_theme = []
+        for month in months:
             td = query_theme_tile(db, int(ti["id"]), str(ti["name"]), month)
-            all_tiles.append(td)
-            tile_month_idx.append(mi)
+            tiles_for_theme.append(td)
+        # Only keep themes that have at least one active month
+        if any(t.activity == "active" for t in tiles_for_theme):
+            theme_tiles[str(ti["name"])] = tiles_for_theme
 
-    active_count = sum(1 for t in all_tiles if t.activity == "active")
-    logger.info(
-        "%d tiles total, %d active, %d dormant",
-        len(all_tiles), active_count, len(all_tiles) - active_count,
-    )
+    if not theme_tiles:
+        raise ValueError("No active themes found in selected months")
 
-    # Skip dormant tiles entirely — only generate art for active ones
-    active_indices = [i for i, t in enumerate(all_tiles) if t.activity == "active"]
-    active_tiles = [all_tiles[i] for i in active_indices]
-    active_month_idxs = [tile_month_idx[i] for i in active_indices]
+    # Pick the best representative tile per theme for layout planning
+    # (the one with most techniques/bets)
+    best_tile: dict[str, ThemeTile] = {}
+    for name, tiles in theme_tiles.items():
+        active = [t for t in tiles if t.activity == "active"]
+        best_tile[name] = max(active, key=lambda t: len(t.techniques) + len(t.design_bets))
 
-    if not active_tiles:
-        raise ValueError("No active theme tiles found in selected months")
+    # Phase 1: LLM plans the vertical arrangement
+    logger.info("Planning layout for %d themes...", len(theme_tiles))
+    row_assignments = plan_layout(best_tile, db, mc)
 
-    # Phase 2: Compute Y positions via PCA on sub-concept vectors
-    y_positions = compute_y_positions(active_tiles)
+    # Sort themes by assigned row
+    sorted_themes = sorted(theme_tiles.keys(), key=lambda t: row_assignments.get(t, 99))
+    n_rows = len(sorted_themes)
+    theme_to_row = {name: i for i, name in enumerate(sorted_themes)}
 
-    # Canvas dimensions
-    tile_size = mc.tile_size
-    fade_px = int(tile_size * mc.vertical_overlap)
-    canvas_w = n_months * tile_size
-    # Height: scale based on Y spread needed
-    n_active_per_month = max(
-        sum(1 for mi in active_month_idxs if mi == m) for m in range(n_months)
-    )
-    canvas_h = max(tile_size * 2, int(tile_size * (n_active_per_month * 0.7 + 0.3)))
-    usable_h = canvas_h - tile_size
+    # Build grid — all active cells
+    grid: list[GridCell] = []
+    grid_lookup: dict[tuple[int, int], GridCell] = {}
 
-    # Place tiles
-    placed: list[PlacedTile] = []
-    for i, (td, mi) in enumerate(zip(active_tiles, active_month_idxs)):
-        x = mi * tile_size
-        y = int(y_positions[i] * usable_h)
-        pt = PlacedTile(data=td, x=x, y=y, y_norm=y_positions[i])
-        placed.append(pt)
+    for theme_name in sorted_themes:
+        row = theme_to_row[theme_name]
+        for col, tile in enumerate(theme_tiles[theme_name]):
+            if tile.activity == "active":
+                cell = GridCell(data=tile, row=row, col=col)
+                grid.append(cell)
+                grid_lookup[(row, col)] = cell
 
-    logger.info("Canvas: %d x %d px, %d active tiles placed", canvas_w, canvas_h, len(placed))
-
-    for pt in placed:
+    logger.info("Grid: %d rows x %d cols, %d active cells", n_rows, n_months, len(grid))
+    for cell in sorted(grid, key=lambda c: (c.row, c.col)):
         logger.info(
-            "  %s / %s → y=%.2f, %d techniques, %d bets",
-            pt.data.theme, pt.data.month, pt.y_norm,
-            len(pt.data.techniques), len(pt.data.design_bets),
+            "  [%d,%d] %s/%s — %d techniques, %d bets",
+            cell.row, cell.col, cell.data.theme, cell.data.month,
+            len(cell.data.techniques), len(cell.data.design_bets),
         )
 
     output_dir = config.resolved_db_path.parent / "mural"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Phase 3: Generate art prompts (sorted by month then y for neighbor context)
-    prompt_order = sorted(range(len(placed)), key=lambda i: (active_month_idxs[i], placed[i].y))
+    tile_size = mc.tile_size
+    overlap = int(tile_size * mc.vertical_overlap)
 
-    # Index for neighbor lookup
-    by_month: dict[int, list[int]] = {}
-    for i, mi in enumerate(active_month_idxs):
-        by_month.setdefault(mi, []).append(i)
-    for mi in by_month:
-        by_month[mi].sort(key=lambda i: placed[i].y)
+    # Phase 2: Generate art prompts in scanline order (corner-out)
+    # Each tile knows its already-generated neighbors
+    scanline = sorted(grid, key=lambda c: (c.row, c.col))
 
-    generated_prompts: dict[int, str] = {}
+    for cell in scanline:
+        neighbors: dict[str, str] = {}
 
-    for idx in prompt_order:
-        pt = placed[idx]
-        mi = active_month_idxs[idx]
+        # Left neighbor
+        left = grid_lookup.get((cell.row, cell.col - 1))
+        if left and left.art_prompt:
+            neighbors["left"] = left.art_prompt
 
-        neighbor_prompts: dict[str, str] = {}
+        # Above neighbor
+        above = grid_lookup.get((cell.row - 1, cell.col))
+        if above and above.art_prompt:
+            neighbors["above"] = above.art_prompt
 
-        # Left: same theme, previous month
-        if mi > 0:
-            for j in range(len(placed)):
-                if (placed[j].data.theme == pt.data.theme
-                        and active_month_idxs[j] == mi - 1
-                        and j in generated_prompts):
-                    neighbor_prompts["left"] = generated_prompts[j]
-                    break
+        cell.art_prompt = generate_tile_prompt(cell.data, mc, neighbors or None)
+        logger.info(
+            "  Prompt [%d,%d] %s: %s...",
+            cell.row, cell.col, cell.data.theme, cell.art_prompt[:80],
+        )
 
-        # Nearest above in same month
-        if mi in by_month:
-            for j in reversed(by_month[mi]):
-                if j != idx and placed[j].y < pt.y and j in generated_prompts:
-                    neighbor_prompts["above"] = generated_prompts[j]
-                    break
-
-        art_prompt = generate_tile_prompt(pt.data, mc, neighbor_prompts or None)
-        generated_prompts[idx] = art_prompt
-        pt.art_prompt = art_prompt
+    # Compute canvas size
+    step = tile_size - overlap
+    canvas_w = tile_size + (n_months - 1) * step
+    canvas_h = tile_size + (n_rows - 1) * step
 
     result = MuralResult(
-        tiles=placed,
-        themes=theme_names,
+        grid=grid,
+        themes=list(sorted_themes),
         months=months,
+        n_rows=n_rows,
+        n_cols=n_months,
         canvas_size=(canvas_w, canvas_h),
         output_dir=output_dir,
     )
 
     if dry_run:
-        print(f"\nMural: {n_themes} themes x {n_months} months → {len(placed)} active tiles")
+        print(f"\nMural: {n_rows} themes x {n_months} months → {len(grid)} active cells")
         print(f"Canvas: {canvas_w} x {canvas_h} px")
-        print(f"Edge fade: {fade_px} px")
-        print(f"Themes: {', '.join(theme_names)}")
+        print(f"Overlap: {overlap} px")
+        print(f"Theme order (LLM-arranged): {', '.join(sorted_themes)}")
         print(f"Months: {', '.join(months)}")
+        print(f"Est. cost: ${len(grid) * 0.04:.2f}")
         print(f"Output: {output_dir}")
         print()
 
-        for mi, month in enumerate(months):
-            month_tiles = [(i, placed[i]) for i in range(len(placed)) if active_month_idxs[i] == mi]
-            if not month_tiles:
-                print(f"--- {month} --- (no active themes)")
-                continue
-            month_tiles.sort(key=lambda t: t[1].y)
-            print(f"--- {month} ({len(month_tiles)} active) ---")
-            for _, pt in month_tiles:
-                td = pt.data
-                print(f"  y={pt.y_norm:.2f} {td.theme}")
-                if td.techniques:
-                    print(f"    Techniques: {', '.join(td.techniques[:5])}")
-                if td.design_bets:
-                    print(f"    Bets: {', '.join(td.design_bets[:5])}")
-                print(f"    Prompt: {pt.art_prompt[:120]}...")
+        for row_idx, theme_name in enumerate(sorted_themes):
+            row_cells = [c for c in scanline if c.row == row_idx]
+            active_months = [months[c.col] for c in row_cells]
+            print(f"Row {row_idx}: {theme_name} ({len(row_cells)} active: {', '.join(active_months)})")
+            for c in row_cells:
+                print(f"  [{c.row},{c.col}] {c.data.month}: {c.art_prompt[:100]}...")
             print()
         return result
 
-    # Phase 4: Generate images
-    client = OpenAI()
-    estimated_cost_per_tile = 0.04
-    cost_estimate = len(placed) * estimated_cost_per_tile
+    # Phase 3: Generate images in scanline order
+    # llm_client import (at top) sets GEMINI_API_KEY/GOOGLE_API_KEY in env
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY not found. Ensure llm_client is imported or set the env var."
+        )
+    client = genai.Client(api_key=api_key)
+    cost_per_tile = 0.04  # ~$0.039 for gemini-2.5-flash-image, free on AI Studio tier
+    cost_estimate = len(grid) * cost_per_tile
 
     if cost_estimate > mc.max_cost:
         raise ValueError(
@@ -538,31 +558,38 @@ def generate_mural(
             f"Reduce tile count or increase max_cost."
         )
 
-    for pt in placed:
-        logger.info("Generating image %s/%s y=%.2f", pt.data.theme, pt.data.month, pt.y_norm)
+    for cell in scanline:
+        logger.info(
+            "Generating [%d,%d] %s/%s",
+            cell.row, cell.col, cell.data.theme, cell.data.month,
+        )
         try:
-            img = generate_tile_image(pt.art_prompt, mc, client)
-            pt.image = img
+            img = generate_tile_image(cell.art_prompt, mc, client)
+            cell.image = img
 
-            safe_name = pt.data.theme.replace("/", "_").replace(" ", "_")
-            tile_path = output_dir / f"tile_{safe_name}_{pt.data.month}.png"
+            safe_name = cell.data.theme.replace("/", "_").replace(" ", "_")
+            tile_path = output_dir / f"tile_{cell.row}_{cell.col}_{safe_name}.png"
             img.save(str(tile_path))
 
         except Exception as e:
-            error_msg = f"{pt.data.theme}/{pt.data.month} failed: {e}"
+            error_msg = f"[{cell.row},{cell.col}] {cell.data.theme}/{cell.data.month}: {e}"
             logger.error(error_msg)
             result.errors.append(error_msg)
 
-    # Phase 5: Assemble
-    mural_img = assemble_mural(placed, canvas_w, canvas_h, tile_size, fade_px)
+    # Phase 4: Assemble
+    mural_img, canvas_w, canvas_h = assemble_mural(grid, n_rows, n_months, tile_size, overlap)
+    mural_img = add_timeline_bar(mural_img, months, tile_size, overlap)
+    result.canvas_size = (canvas_w, canvas_h)
+
     mural_path = output_dir / "mural.png"
     mural_img.save(str(mural_path))
 
-    generated_count = sum(1 for pt in placed if pt.image is not None)
-    result.total_cost = generated_count * estimated_cost_per_tile
+    generated_count = sum(1 for c in grid if c.image is not None)
+    result.total_cost = generated_count * cost_per_tile
 
     print(f"\nMural generated: {mural_path}")
-    print(f"Tiles: {generated_count}/{len(placed)} generated")
+    print(f"Tiles: {generated_count}/{len(grid)} generated")
+    print(f"Theme order: {', '.join(sorted_themes)}")
     if result.errors:
         print(f"Errors: {len(result.errors)}")
         for err in result.errors:

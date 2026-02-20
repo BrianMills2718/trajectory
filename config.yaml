@@ -47,9 +47,9 @@ mural:
   tile_size: 1024
   vertical_overlap: 0.35  # fraction of tile height overlapping between adjacent rows
   quality: medium
-  style_suffix: "digital art mural, dark background with glowing nodes and flowing connections, technical but beautiful, cohesive palette"
+  style_suffix: "detailed illustration in the style of a fantasy world-building concept art, rich colors, warm lighting, painterly brushwork, each scene distinct but connected"
   prompt_model: gemini/gemini-2.5-flash-lite
-  image_model: gpt-image-1
+  image_model: gemini-2.5-flash-image
   max_cost: 2.00
   max_projects: 6
   max_months: 4

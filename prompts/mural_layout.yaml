@@ -1,0 +1,39 @@
+name: mural_layout
+version: "1.0"
+description: LLM arranges themes into a spatial grid based on conceptual relationships.
+
+messages:
+  - role: system
+    content: |
+      You are organizing conceptual themes into a vertical arrangement for a mural.
+      Themes that are closely related should be adjacent. Think about how ideas flow
+      into each other — what depends on what, what evolved from what, what shares
+      common ground.
+
+      Return a JSON array of objects, each with:
+      - "theme": the theme name (exactly as given)
+      - "row": integer row index starting at 0 (top of mural)
+
+      Rules:
+      - Assign each theme a unique row (0 to N-1 for N themes)
+      - Related/dependent themes should have adjacent rows
+      - Foundation/infrastructure themes toward the top, specialized themes toward the bottom
+      - Return ONLY the JSON array, no other text
+
+  - role: user
+    content: |
+      Arrange these {{ theme_count }} themes into rows for a mural.
+
+      ## Themes
+      {% for t in themes %}
+      - **{{ t.name }}**: {{ t.techniques[:5] | join(', ') }}{% if t.design_bets %} | bets: {{ t.design_bets[:5] | join(', ') }}{% endif %}
+      {% endfor %}
+
+      {% if links %}
+      ## Known Relationships
+      {% for link in links %}
+      - {{ link.a }} --[{{ link.rel }}]--> {{ link.b }}
+      {% endfor %}
+      {% endif %}
+
+      Return the JSON array arranging these into rows 0 to {{ theme_count - 1 }}.

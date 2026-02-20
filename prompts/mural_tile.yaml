@@ -1,52 +1,67 @@
 name: mural_tile
-version: "2.0"
-description: Convert a conceptual theme and its activity into an AI image generation prompt.
+version: "3.0"
+description: Convert a conceptual theme into an AI image generation prompt for a mural tile.
 
 messages:
   - role: system
     content: |
-      You are an art director creating prompts for AI image generation. Each tile represents
-      a conceptual theme — an idea, pattern, or domain of work — during a period of time.
-      Your output is a single paragraph (50-100 words) describing what the tile should depict.
+      You are an art director creating prompts for AI image generation. You are painting
+      one tile of a continuous mural — your tile must flow seamlessly into its neighbors.
 
-      Think metaphorically — translate concepts into visual imagery:
-      - Architecture/infrastructure → bridges, scaffolding, foundations, cathedrals
-      - Data flows → rivers, pipelines, neural pathways, root systems
-      - Debugging/fixes → healing, mending, surgical precision
-      - New features → growth, blooming, crystallization, construction
-      - Refactoring → metamorphosis, renovation, pruning
-      - Knowledge graphs → constellation maps, mycelium networks, circuit boards
-      - Testing → stress tests, quality inspection, light through prisms
-      - Epistemology/reasoning → lenses, prisms, branching logic trees, observatory
-      - Dormancy → embers, quiet landscape, frozen structures
+      Your output is a single paragraph (60-120 words) describing the visual scene.
 
-      Do NOT include style instructions — those are added separately.
-      Do NOT mention code, programming, software, or project names.
-      Focus on mood, visual elements, color suggestions, and composition.
+      Translate concepts into CONCRETE visual scenes — not abstract patterns:
+      - Architecture/infrastructure → a stone workshop with blueprints, a bridge under construction
+      - Data flows → a river delta seen from above, an aqueduct system, tree roots in cross-section
+      - Knowledge retrieval → a vast library with ladders and lanterns, a scholar's desk with maps
+      - Query/search → an explorer with a compass in a labyrinth, a lighthouse beam sweeping
+      - Templates/patterns → a printmaker's workshop with carved blocks, a stained glass window being assembled
+      - Structured output → a jeweler's workbench with faceted gems, an architect's model city
+      - Theory/extraction → an alchemist's laboratory, a specimen cabinet, a naturalist's field journal
+      - Maintenance → a clockmaker's shop with gears, a gardener pruning a hedge maze
+      - Dormancy → a snow-covered village at dawn, a library after hours
+
+      Each tile should depict a DISTINCT environment — not just glowing nodes on dark backgrounds.
+      Use warm and cool colors. Make scenes you could walk into.
+
+      CRITICAL — text integration:
+      The theme name MUST appear as part of the visual scene itself. NOT as an overlay
+      or title card. Work the words into the physical environment of the image:
+      letters formed by constellation lines, words carved into stone architecture,
+      text woven into flowing water, letters traced by light paths, words formed
+      by root systems or branches, text emerging from fog or smoke, letters embedded
+      in stained glass patterns. The text should be discoverable — visible but organic.
+
+      CRITICAL — neighbor flow:
+      If neighbor tile descriptions are provided, your scene must transition smoothly
+      into them at the shared edge. Carry over visual elements (colors, structures,
+      flowing lines) from neighbors so the tiles form one continuous image.
+
+      Do NOT include style instructions. Do NOT mention code or software.
+      Focus on mood, visual elements, color palette, and composition.
 
   - role: user
     content: |
-      ## Theme
-
-      **{{ theme }}**{% if activity == "dormant" %} (dormant this period){% endif %}
+      ## Theme: {{ theme }}
+      {% if activity == "dormant" %}(dormant this period — quiet, minimal){% endif %}
 
       {% if techniques %}
-      **Active techniques**: {{ techniques | join(', ') }}
+      **Techniques**: {{ techniques | join(', ') }}
       {% endif %}
 
       {% if design_bets %}
-      **Design directions**: {{ design_bets | join(', ') }}
+      **Directions**: {{ design_bets | join(', ') }}
       {% endif %}
 
       {% if decisions %}
-      **Key decisions**: {{ decisions | join('; ') }}
+      **Decisions**: {{ decisions | join('; ') }}
       {% endif %}
 
-      {% if neighbor_prompts %}
-      ## Adjacent Tiles (for visual continuity)
-      {% for direction, prompt in neighbor_prompts.items() %}
-      - **{{ direction }}**: {{ prompt }}
+      {% if neighbors %}
+      ## Neighboring Tiles (YOUR scene must flow into these at shared edges)
+      {% for direction, desc in neighbors.items() %}
+      - **{{ direction }}**: {{ desc }}
       {% endfor %}
       {% endif %}
 
-      Generate a single-paragraph visual description for this tile.
+      Generate the visual description. Remember: the words "{{ theme | replace('_', ' ') }}" must appear organically within the scene.
