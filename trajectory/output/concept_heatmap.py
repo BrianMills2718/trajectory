@@ -189,6 +189,14 @@ def _generate_all_buckets(first: str, last: str, granularity: str) -> list[str]:
 # --- Data ---
 
 @dataclass
+class CellEvent:
+    """Single event for a tooltip."""
+    title: str
+    event_type: str
+    significance: float
+
+
+@dataclass
 class ConceptHeatmapData:
     """All data needed to render a concept heatmap."""
     project_name: str
@@ -199,6 +207,8 @@ class ConceptHeatmapData:
     groups: dict[str, list[tuple[str, float, dict[str, int]]]] = field(default_factory=dict)
     # Total events per bucket (for summary row)
     bucket_totals: dict[str, int] = field(default_factory=dict)
+    # Per-cell event details for tooltips: (concept_name, bucket_key) → list of events
+    cell_details: dict[tuple[str, str], list[CellEvent]] = field(default_factory=dict)
     max_count: int = 1
     total_events: int = 0
     total_concepts: int = 0
@@ -250,19 +260,20 @@ def query_heatmap_data(
     include_year = (granularity == "month" and span["first"][:4] != span["last"][:4])
     bucket_labels = [_bucket_label(b, granularity, include_year=include_year) for b in buckets]
 
-    # Get per-concept, per-timestamp data
+    # Get per-concept, per-event data (including event details for tooltips)
     rows = db.conn.execute("""
         SELECT c.name, c.level, c.importance,
-               e.timestamp, COUNT(*) as cnt
+               e.timestamp, e.title, e.event_type, e.significance
         FROM concept_events ce
         JOIN concepts c ON ce.concept_id = c.id
         JOIN events e ON ce.event_id = e.id
         WHERE e.project_id = ?
-        GROUP BY c.id, e.timestamp
+        ORDER BY c.name, e.timestamp
     """, (project_id,)).fetchall()
 
-    # Aggregate into buckets
+    # Aggregate into buckets and collect cell details
     concept_data: dict[str, dict[str, object]] = {}  # name → {level, total_count, buckets: {key: count}}
+    cell_details: dict[tuple[str, str], list[CellEvent]] = defaultdict(list)
     for row in rows:
         name = row["name"]
         if name not in concept_data:
@@ -272,8 +283,13 @@ def query_heatmap_data(
                 "buckets": defaultdict(int),
             }
         bkey = _bucket_key(row["timestamp"], granularity)
-        concept_data[name]["buckets"][bkey] += row["cnt"]  # type: ignore[index]
-        concept_data[name]["total_count"] = int(concept_data[name]["total_count"]) + row["cnt"]  # type: ignore[arg-type]
+        concept_data[name]["buckets"][bkey] += 1  # type: ignore[index]
+        concept_data[name]["total_count"] = int(concept_data[name]["total_count"]) + 1  # type: ignore[arg-type]
+        cell_details[(name, bkey)].append(CellEvent(
+            title=row["title"] or "",
+            event_type=row["event_type"] or "",
+            significance=row["significance"] or 0,
+        ))
 
     # Sort by project-local event count (not cross-project importance), take top N.
     # Exclude concepts with only 1 event — not meaningful for a heatmap.
@@ -322,6 +338,12 @@ def query_heatmap_data(
     except (ValueError, TypeError):
         span_days = 0
 
+    # Filter cell_details to only include concepts that made the cut
+    selected_names = {name for name, _ in sorted_concepts}
+    filtered_details = {
+        k: v for k, v in cell_details.items() if k[0] in selected_names
+    }
+
     return ConceptHeatmapData(
         project_name=project.name,
         granularity=granularity,
@@ -331,6 +353,7 @@ def query_heatmap_data(
         max_count=max_count,
         total_events=total_events,
         bucket_totals=dict(bucket_totals),
+        cell_details=filtered_details,
         total_concepts=len(sorted_concepts),
         span_days=span_days,
     )
@@ -535,11 +558,385 @@ def render_heatmap(data: ConceptHeatmapData, output_path: Path) -> Path:
     return output_path
 
 
+def _html_color(r: int, g: int, b: int) -> str:
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _escape_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def render_heatmap_html(data: ConceptHeatmapData, output_path: Path) -> Path:
+    """Render the concept heatmap as an interactive HTML page."""
+    cell_size = 20
+    cell_gap = 3
+    cell_step = cell_size + cell_gap
+
+    level_order = ["theme", "design_bet", "technique"]
+    level_labels = {"theme": "THEMES", "design_bet": "DESIGN BETS", "technique": "TECHNIQUES"}
+    level_css_colors = {
+        "theme": _html_color(*LEVEL_RAMPS["theme"][3]),
+        "design_bet": _html_color(*LEVEL_RAMPS["design_bet"][3]),
+        "technique": _html_color(*LEVEL_RAMPS["technique"][3]),
+    }
+
+    # Build JSON data for tooltips
+    import json
+    tooltip_data: dict[str, object] = {}
+    for (concept_name, bkey), events in data.cell_details.items():
+        key = f"{concept_name}|{bkey}"
+        tooltip_data[key] = [
+            {"title": _escape_html(e.title[:80]), "type": e.event_type, "sig": round(e.significance, 2)}
+            for e in events
+        ]
+
+    # Build CSS color ramps as functions
+    ramp_css: dict[str, list[str]] = {}
+    for level in level_order:
+        ramp = LEVEL_RAMPS.get(level, DEFAULT_RAMP)
+        ramp_css[level] = [_html_color(*c) for c in ramp]
+
+    gran_label = {"day": "daily", "week": "weekly", "month": "monthly"}[data.granularity]
+
+    # Build rows HTML
+    rows_html = []
+
+    # Summary row
+    max_total = max(data.bucket_totals.values()) if data.bucket_totals else 1
+    summary_cells = []
+    for bkey in data.buckets:
+        count = data.bucket_totals.get(bkey, 0)
+        if count == 0:
+            bg = _html_color(*CELL_EMPTY)
+        else:
+            t = min(count / max(max_total, 1), 1.0)
+            gray = int(40 + t * 160)
+            bg = _html_color(gray, gray, gray)
+        summary_cells.append(
+            f'<div class="cell" style="background:{bg}" '
+            f'title="{data.bucket_labels[data.buckets.index(bkey)]}: {count} events"></div>'
+        )
+    rows_html.append(f'''
+        <div class="row summary-row">
+            <div class="label bold">ALL EVENTS</div>
+            <div class="badge"></div>
+            <div class="cells">{"".join(summary_cells)}</div>
+        </div>
+    ''')
+
+    for level in level_order:
+        concepts = data.groups.get(level, [])
+        if not concepts:
+            continue
+
+        color = level_css_colors.get(level, "#6e7681")
+        rows_html.append(
+            f'<div class="group-header" style="color:{color}">'
+            f'▎ {level_labels.get(level, level.upper())} ({len(concepts)})</div>'
+        )
+
+        for concept_name, event_count, bucket_counts in concepts:
+            cells = []
+            for j, bkey in enumerate(data.buckets):
+                count = bucket_counts.get(bkey, 0)
+                color_tuple = _heat_color(count, data.max_count, level)
+                bg = _html_color(*color_tuple)
+                tooltip_key = f"{concept_name}|{bkey}"
+                has_detail = tooltip_key in tooltip_data
+                cells.append(
+                    f'<div class="cell{" has-events" if has_detail else ""}" '
+                    f'style="background:{bg}" '
+                    f'data-concept="{_escape_html(concept_name)}" '
+                    f'data-bucket="{bkey}" '
+                    f'data-label="{data.bucket_labels[j]}" '
+                    f'data-count="{count}"></div>'
+                )
+            badge = str(int(event_count)) if event_count == int(event_count) else f"{event_count:.1f}"
+            rows_html.append(f'''
+                <div class="row" data-level="{level}">
+                    <div class="label" title="{_escape_html(concept_name)}">{_escape_html(concept_name)}</div>
+                    <div class="badge">{badge}</div>
+                    <div class="cells">{"".join(cells)}</div>
+                </div>
+            ''')
+
+    # Column headers
+    col_headers = []
+    for label in data.bucket_labels:
+        col_headers.append(f'<div class="col-header"><span>{_escape_html(label)}</span></div>')
+
+    # Legend
+    legend_parts = []
+    legend_parts.append('<span class="legend-label">Less</span>')
+    for level in level_order:
+        short = {"theme": "Themes", "design_bet": "Bets", "technique": "Techniques"}[level]
+        legend_parts.append(f'<span class="legend-level-label">{short}</span>')
+        legend_parts.append(f'<div class="legend-cell" style="background:{_html_color(*CELL_EMPTY)}"></div>')
+        for c in ramp_css[level]:
+            legend_parts.append(f'<div class="legend-cell" style="background:{c}"></div>')
+    legend_parts.append('<span class="legend-label">More</span>')
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_escape_html(data.project_name)} — Concept Heatmap</title>
+<style>
+:root {{
+    --bg: {_html_color(*BG)};
+    --text: {_html_color(*TEXT)};
+    --text-dim: {_html_color(*TEXT_DIM)};
+    --divider: {_html_color(*DIVIDER)};
+    --cell-empty: {_html_color(*CELL_EMPTY)};
+    --cell-size: {cell_size}px;
+    --cell-gap: {cell_gap}px;
+    --cell-step: {cell_step}px;
+    --label-width: 260px;
+    --badge-width: 36px;
+}}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    padding: 24px;
+    min-width: 600px;
+}}
+h1 {{
+    font-size: 24px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}}
+.subtitle {{
+    color: var(--text-dim);
+    font-size: 13px;
+    margin-bottom: 16px;
+}}
+.divider {{
+    border-top: 1px solid var(--divider);
+    margin: 12px 0;
+}}
+.col-headers {{
+    display: flex;
+    margin-left: calc(var(--label-width) + var(--badge-width));
+    margin-bottom: 4px;
+}}
+.col-header {{
+    width: var(--cell-step);
+    flex-shrink: 0;
+    text-align: center;
+    position: relative;
+    height: 50px;
+}}
+.col-header span {{
+    display: block;
+    font-size: 10px;
+    font-family: 'DejaVu Sans Mono', 'Courier New', monospace;
+    color: var(--text-dim);
+    transform: rotate(-55deg);
+    transform-origin: bottom left;
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    white-space: nowrap;
+}}
+.group-header {{
+    font-size: 12px;
+    font-weight: 700;
+    padding: 8px 0 4px 0;
+}}
+.row {{
+    display: flex;
+    align-items: center;
+    height: var(--cell-step);
+}}
+.row.summary-row {{
+    margin-bottom: 6px;
+}}
+.label {{
+    width: var(--label-width);
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-left: 4px;
+}}
+.label.bold {{
+    font-weight: 700;
+}}
+.badge {{
+    width: var(--badge-width);
+    flex-shrink: 0;
+    font-size: 10px;
+    font-family: 'DejaVu Sans Mono', 'Courier New', monospace;
+    color: var(--text-dim);
+    text-align: right;
+    padding-right: 6px;
+}}
+.cells {{
+    display: flex;
+    gap: var(--cell-gap);
+}}
+.cell {{
+    width: var(--cell-size);
+    height: var(--cell-size);
+    border-radius: 3px;
+    flex-shrink: 0;
+    cursor: default;
+    transition: outline 0.1s;
+}}
+.cell.has-events {{
+    cursor: pointer;
+}}
+.cell:hover {{
+    outline: 2px solid var(--text-dim);
+    outline-offset: 1px;
+}}
+.legend {{
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--divider);
+}}
+.legend-label {{
+    font-size: 11px;
+    color: var(--text-dim);
+    margin: 0 4px;
+}}
+.legend-level-label {{
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-left: 8px;
+}}
+.legend-cell {{
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+}}
+/* Tooltip */
+#tooltip {{
+    display: none;
+    position: fixed;
+    background: #1c2128;
+    border: 1px solid var(--divider);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 12px;
+    max-width: 360px;
+    z-index: 100;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    pointer-events: none;
+}}
+#tooltip .tt-header {{
+    font-weight: 700;
+    margin-bottom: 6px;
+    color: var(--text);
+}}
+#tooltip .tt-event {{
+    color: var(--text-dim);
+    margin-bottom: 3px;
+    line-height: 1.4;
+}}
+#tooltip .tt-event .tt-type {{
+    display: inline-block;
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: #2d333b;
+    margin-right: 4px;
+}}
+</style>
+</head>
+<body>
+
+<h1>{_escape_html(data.project_name)}</h1>
+<p class="subtitle">{data.total_concepts} concepts · {data.total_events} events · {data.span_days} days · {gran_label}</p>
+<div class="divider"></div>
+
+<div class="col-headers">
+    {"".join(col_headers)}
+</div>
+
+{"".join(rows_html)}
+
+<div class="legend">
+    {"".join(legend_parts)}
+</div>
+
+<div id="tooltip">
+    <div class="tt-header"></div>
+    <div class="tt-body"></div>
+</div>
+
+<script>
+const tooltipData = {json.dumps(tooltip_data)};
+const tooltip = document.getElementById('tooltip');
+const ttHeader = tooltip.querySelector('.tt-header');
+const ttBody = tooltip.querySelector('.tt-body');
+
+document.querySelectorAll('.cell[data-concept]').forEach(cell => {{
+    cell.addEventListener('mouseenter', (e) => {{
+        const concept = cell.dataset.concept;
+        const bucket = cell.dataset.bucket;
+        const label = cell.dataset.label;
+        const count = cell.dataset.count;
+        const key = concept + '|' + bucket;
+        const events = tooltipData[key];
+
+        ttHeader.textContent = concept + ' — ' + label + ' (' + count + ' events)';
+
+        if (events && events.length > 0) {{
+            ttBody.innerHTML = events.map(ev =>
+                '<div class="tt-event"><span class="tt-type">' + ev.type + '</span>' + ev.title + '</div>'
+            ).join('');
+        }} else if (parseInt(count) > 0) {{
+            ttBody.innerHTML = '<div class="tt-event">Events linked to this concept</div>';
+        }} else {{
+            ttBody.innerHTML = '';
+        }}
+
+        tooltip.style.display = 'block';
+        const rect = cell.getBoundingClientRect();
+        let left = rect.right + 8;
+        let top = rect.top - 10;
+
+        // Keep tooltip on screen
+        if (left + 360 > window.innerWidth) {{
+            left = rect.left - 368;
+        }}
+        if (top + tooltip.offsetHeight > window.innerHeight) {{
+            top = window.innerHeight - tooltip.offsetHeight - 8;
+        }}
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = Math.max(8, top) + 'px';
+    }});
+
+    cell.addEventListener('mouseleave', () => {{
+        tooltip.style.display = 'none';
+    }});
+}});
+</script>
+
+</body>
+</html>'''
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html)
+    logger.info("HTML heatmap saved to %s", output_path)
+    return output_path
+
+
 def generate_concept_heatmap(
     db: TrajectoryDB,
     project_name: str,
     output_dir: Path | None = None,
     max_concepts: int = 60,
+    html: bool = False,
 ) -> Path:
     """Generate a concept heatmap for a project. Returns output path."""
     project = db.get_project_by_name(project_name)
@@ -550,6 +947,10 @@ def generate_concept_heatmap(
 
     if output_dir is None:
         output_dir = Path("data/heatmap")
-    output_path = output_dir / f"{project_name}_heatmap.png"
 
-    return render_heatmap(data, output_path)
+    if html:
+        output_path = output_dir / f"{project_name}_heatmap.html"
+        return render_heatmap_html(data, output_path)
+    else:
+        output_path = output_dir / f"{project_name}_heatmap.png"
+        return render_heatmap(data, output_path)

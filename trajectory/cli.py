@@ -112,6 +112,7 @@ def main() -> None:
     hm_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     hm_parser.add_argument("project", help="Project name (as stored in trajectory DB)")
     hm_parser.add_argument("--max-concepts", type=int, default=40, help="Max concept rows")
+    hm_parser.add_argument("--html", action="store_true", help="Output interactive HTML instead of PNG")
 
     # dataflow command — single-project dataflow mural
     df_parser = sub.add_parser("dataflow", help="Generate single-project dataflow mural")
@@ -310,6 +311,7 @@ def main() -> None:
                 db,
                 project_name=args.project,
                 max_concepts=args.max_concepts,
+                html=args.html,
             )
             print(f"Output: {path}")
 
