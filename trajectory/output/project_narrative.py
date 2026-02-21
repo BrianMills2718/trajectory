@@ -262,6 +262,106 @@ def generate_narrative(
     return output_path
 
 
+def record_video(
+    html_path: Path,
+    output_path: Path | None = None,
+    width: int = 1920,
+    height: int = 1080,
+    speed: float = 2.0,
+) -> Path:
+    """Record the narrative cinema mode as a WebM video using Playwright.
+
+    Opens the HTML in a headless browser with ?autoplay, records until
+    cinema mode completes, then saves the recording.
+    """
+    import shutil
+
+    from playwright.sync_api import sync_playwright
+
+    html_path = Path(html_path).resolve()
+    if not html_path.exists():
+        raise FileNotFoundError(f"HTML file not found: {html_path}")
+
+    if output_path is None:
+        output_path = html_path.with_suffix(".webm")
+    output_path = Path(output_path)
+
+    # Use a temp dir for recording so we don't pollute the output dir
+    tmp_dir = output_path.parent / ".video_tmp"
+    tmp_dir.mkdir(exist_ok=True)
+
+    logger.info(
+        "Recording video: %s → %s (%dx%d, speed=%sx)",
+        html_path.name, output_path.name, width, height, speed,
+    )
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        context = browser.new_context(
+            viewport={"width": width, "height": height},
+            record_video_dir=str(tmp_dir),
+            record_video_size={"width": width, "height": height},
+        )
+        page = context.new_page()
+
+        # Load the narrative with autoplay
+        url = f"file://{html_path}?autoplay"
+        page.goto(url, wait_until="networkidle")
+
+        # Set playback speed via JS
+        speed_val = float(speed)
+        page.evaluate(f"""() => {{
+            const speeds = [0.5, 1, 2, 4];
+            const targetIdx = speeds.indexOf({speed_val});
+            const speedBtn = document.getElementById('cinema-speed');
+            if (speedBtn && targetIdx > 1) {{
+                for (let i = 1; i < targetIdx; i++) speedBtn.click();
+            }}
+        }}""")
+
+        # Wait for cinema to finish — poll the progress bar
+        logger.info("Cinema playing... waiting for completion")
+        page.wait_for_function(
+            """() => {
+                const progress = document.getElementById('cinema-progress');
+                return progress && progress.style.width === '100%';
+            }""",
+            timeout=600000,  # 10 min max
+        )
+
+        logger.info("Cinema completed. Finalizing video...")
+        page.wait_for_timeout(3000)
+
+        # Must save video path before closing page
+        video = page.video
+        if video:
+            video_path = video.path()
+        else:
+            video_path = None
+
+        page.close()
+        context.close()
+        browser.close()
+
+    # Move recorded file to desired output path
+    if video_path and Path(video_path).exists():
+        shutil.move(str(video_path), str(output_path))
+    else:
+        # Fallback: find the most recent webm in tmp dir
+        webms = sorted(tmp_dir.glob("*.webm"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if webms:
+            shutil.move(str(webms[0]), str(output_path))
+        else:
+            raise RuntimeError("Video recording failed — no output file found")
+
+    # Clean up tmp dir
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    size_mb = output_path.stat().st_size / 1e6
+    logger.info("Video saved: %s (%.1f MB)", output_path, size_mb)
+    return output_path
+
+
 def _esc(s: str) -> str:
     return (
         s.replace("&", "&amp;")
@@ -524,6 +624,22 @@ body {{
     stroke: var(--green);
     stroke-width: 3;
     filter: drop-shadow(0 0 8px rgba(126, 231, 135, 0.4));
+}}
+/* Node breathing pulse when revealed */
+.graph-node.revealed rect,
+.graph-node.revealed polygon {{
+    animation: nodePulse 3s ease-in-out infinite;
+}}
+.graph-node.type-win.revealed rect {{
+    animation: winPulse 2s ease-in-out infinite;
+}}
+@keyframes nodePulse {{
+    0%, 100% {{ filter: drop-shadow(0 0 0px transparent); }}
+    50% {{ filter: drop-shadow(0 0 6px rgba(88, 166, 255, 0.25)); }}
+}}
+@keyframes winPulse {{
+    0%, 100% {{ filter: drop-shadow(0 0 8px rgba(126, 231, 135, 0.4)); }}
+    50% {{ filter: drop-shadow(0 0 18px rgba(126, 231, 135, 0.7)); }}
 }}
 .graph-node text {{
     fill: var(--text);
@@ -865,6 +981,23 @@ body {{
     50% {{ opacity: 0; }}
 }}
 
+/* --- Phase flash overlay --- */
+.phase-flash {{
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    pointer-events: none;
+    z-index: 50;
+    opacity: 0;
+}}
+.phase-flash.active {{
+    animation: phaseFlash 0.8s ease-out forwards;
+}}
+@keyframes phaseFlash {{
+    0% {{ opacity: 0.15; }}
+    100% {{ opacity: 0; }}
+}}
+
 /* --- Particle canvas --- */
 #particle-canvas {{
     position: fixed;
@@ -939,6 +1072,7 @@ body {{
 </head>
 <body>
 <canvas id="particle-canvas"></canvas>
+<div class="phase-flash" id="phase-flash"></div>
 
 <!-- Hero -->
 <div class="hero">
@@ -1058,11 +1192,25 @@ body {{
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         for (let i = particles.length - 1; i >= 0; i--) {{
             const p = particles[i];
-            p.x += p.vx;
-            p.y += p.vy;
+
+            // Edge-traveling particles follow SVG path
+            if (p._traveler) {{
+                p._traveler.t += 0.025;
+                if (p._traveler.t >= 1) {{ p.life = 0; }}
+                else {{
+                    try {{
+                        const pt = p._traveler.pathEl.getPointAtLength(
+                            p._traveler.t * p._traveler.totalLen);
+                        p.x = p._traveler.rect.left + (pt.x * p._traveler.z) - p._traveler.sx;
+                        p.y = p._traveler.rect.top + (pt.y * p._traveler.z) - p._traveler.sy;
+                    }} catch(e) {{ p.life = 0; }}
+                }}
+            }} else {{
+                p.x += p.vx;
+                p.y += p.vy;
+            }}
             p.life--;
 
-            // Ambient particles wrap around
             if (p.ambient) {{
                 if (p.y < -10) {{ p.y = canvas.height + 10; p.x = Math.random() * canvas.width; }}
                 if (p.x < -10) p.x = canvas.width + 10;
@@ -1072,6 +1220,7 @@ body {{
 
             const alpha = p.ambient
                 ? 0.15 + 0.1 * Math.sin(p.life * 0.02)
+                : p._traveler ? 0.85
                 : Math.max(0, p.life / p.maxLife) * 0.7;
 
             ctx.beginPath();
@@ -1079,11 +1228,11 @@ body {{
             ctx.fillStyle = 'rgba(' + p.color[0] + ',' + p.color[1] + ',' + p.color[2] + ',' + alpha + ')';
             ctx.fill();
 
-            // Non-ambient particles: glow
-            if (!p.ambient && p.r > 1.5) {{
+            // Glow halo
+            if (!p.ambient && p.r > 1) {{
                 ctx.beginPath();
-                ctx.arc(p.x, p.y, p.r * 3, 0, Math.PI * 2);
-                ctx.fillStyle = 'rgba(' + p.color[0] + ',' + p.color[1] + ',' + p.color[2] + ',' + (alpha * 0.15) + ')';
+                ctx.arc(p.x, p.y, p.r * (p._traveler ? 5 : 3), 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(' + p.color[0] + ',' + p.color[1] + ',' + p.color[2] + ',' + (alpha * 0.2) + ')';
                 ctx.fill();
             }}
 
@@ -1108,6 +1257,24 @@ body {{
                 r: 1 + Math.random() * (type === 'win' ? 3 : 2),
                 life: 60 + Math.random() * 60,
             }}));
+        }}
+    }};
+
+    // Edge-traveling particles: spawn particles that flow along an SVG path
+    window._edgeParticles = function(pathEl, containerRect, scrollLeft, scrollTop, zoomLvl) {{
+        if (!pathEl) return;
+        const totalLen = pathEl.getTotalLength();
+        if (totalLen < 10) return;
+        const color = COLORS.beat;
+        const count = Math.min(8, Math.max(3, Math.floor(totalLen / 30)));
+        for (let i = 0; i < count; i++) {{
+            setTimeout(function() {{
+                var p = new Particle(0, 0, color, {{
+                    r: 1.5 + Math.random(), life: 80, vx: 0, vy: 0 }});
+                p._traveler = {{ pathEl: pathEl, totalLen: totalLen, t: 0,
+                    rect: containerRect, sx: scrollLeft, sy: scrollTop, z: zoomLvl }};
+                particles.push(p);
+            }}, i * 60);
         }}
     }};
 }})();
@@ -1432,9 +1599,25 @@ GRAPH_DATA.nodes.forEach(n => {{
 const visibleNodes = new Set();
 const nodeById = {{}};
 GRAPH_DATA.nodes.forEach(n => {{ nodeById[n.id] = n; }});
+let lastFlashedPhase = -1;
+
+// Phase color map for flash effect
+const PHASE_COLORS = {json.dumps([p.get('color', '#58a6ff') for p in narrative.get('phases', [])])};
 
 function revealUpTo(phase, step) {{
     let stagger = 0;
+
+    // Phase flash on new phase entry
+    if (phase > lastFlashedPhase) {{
+        lastFlashedPhase = phase;
+        const flash = document.getElementById('phase-flash');
+        if (flash) {{
+            flash.style.background = PHASE_COLORS[phase] || '#58a6ff';
+            flash.classList.remove('active');
+            void flash.offsetWidth; // reflow to restart animation
+            flash.classList.add('active');
+        }}
+    }}
 
     // Reveal phase backgrounds
     for (let p = 0; p <= phase; p++) {{
@@ -1454,6 +1637,8 @@ function revealUpTo(phase, step) {{
                 .ease(d3.easeBackOut.overshoot(1.1))
                 .style('opacity', 1)
                 .on('end', () => {{
+                    // Add breathing pulse class
+                    nodeEl.classed('revealed', true);
                     // Particle burst from node position on screen
                     const nd = g.node(n.id);
                     if (nd && window._particleBurst) {{
@@ -1490,6 +1675,15 @@ function revealUpTo(phase, step) {{
                     sel.select('text').style('opacity', 0)
                         .transition().delay(400).duration(300).style('opacity', 1);
                     if (window._playEdgeSound) window._playEdgeSound();
+                    // Edge-traveling particles
+                    if (window._edgeParticles) {{
+                        const container = document.querySelector('.diagram-container');
+                        if (container) {{
+                            window._edgeParticles(
+                                path.node(), container.getBoundingClientRect(),
+                                container.scrollLeft, container.scrollTop, zoomLevel);
+                        }}
+                    }}
                 }} else {{
                     sel.transition().duration(500).style('opacity', 1);
                     if (window._playEdgeSound) window._playEdgeSound();

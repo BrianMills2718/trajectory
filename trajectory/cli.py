@@ -132,6 +132,14 @@ def main() -> None:
         "--model", type=str, default=None,
         help="LLM model for synthesis (default: gemini-2.5-flash)",
     )
+    narr_parser.add_argument(
+        "--video", action="store_true",
+        help="Record cinema mode as WebM video (requires playwright)",
+    )
+    narr_parser.add_argument(
+        "--video-speed", type=float, default=2.0,
+        help="Playback speed for video recording (default: 2x)",
+    )
 
     # dataflow command — single-project dataflow mural
     df_parser = sub.add_parser("dataflow", help="Generate single-project dataflow mural")
@@ -354,6 +362,12 @@ def main() -> None:
                 kwargs["model"] = args.model
             path = generate_narrative(db, project_name=args.project, **kwargs)
             print(f"Output: {path}")
+
+            if args.video:
+                from trajectory.output.project_narrative import record_video
+
+                video_path = record_video(path, speed=args.video_speed)
+                print(f"Video: {video_path}")
 
         elif args.command == "mural":
             from trajectory.output.mural import generate_mural
