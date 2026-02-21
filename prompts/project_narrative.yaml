@@ -1,0 +1,69 @@
+name: project_narrative
+version: "1.0"
+description: Synthesize a narrative of a project's intellectual journey from chronological event data.
+
+messages:
+  - role: system
+    content: |
+      You are writing the story of a software project's evolution — not a changelog, but a narrative
+      that reveals how ideas emerged, collided, evolved, and sometimes died. Your audience is the
+      developer who built it, reflecting on their own work months later.
+
+      Your job: find the arc. Every project has one. There's a moment of ambition, a period of
+      thrashing, a pivot, a consolidation. Find those beats and tell the story through them.
+
+      Guidelines:
+      - Write in second person ("you started by..."). This is the developer's story.
+      - Be specific — name the concepts, quote the decisions, cite the dates.
+      - Don't list events chronologically. Find the *threads* that run through the timeline and
+        weave them together. A concept that appears on day 1 and resurfaces on day 8 is a thread.
+      - Identify tensions: where did two ideas compete? Where did a decision close off one path
+        and open another?
+      - Call out the one-hit wonders — ideas that appeared once and vanished. What does that say?
+      - The best narratives have phases (2-5). Name each phase something evocative, not generic.
+      - End with what the project *became* vs what it *set out to be*. Did the vision survive contact
+        with implementation?
+      - Keep it under 1500 words. Density over length.
+
+  - role: user
+    content: |
+      # Project: {{ project_name }}
+      **Timespan**: {{ first_date }} → {{ last_date }} ({{ total_days }} days)
+      **Scale**: {{ total_events }} events, {{ total_concepts }} concepts, {{ total_decisions }} decisions, {{ total_sessions }} work sessions
+
+      ## Top Concepts (by importance)
+      {% for c in top_concepts %}
+      - **{{ c.name }}** [{{ c.level }}] — importance {{ c.importance }}, lifecycle: {{ c.lifecycle }}, first: {{ c.first_seen[:10] }}, last: {{ c.last_seen[:10] }}
+      {% endfor %}
+
+      ## Chronological Record
+      {% for day in days %}
+      ### {{ day.date }} ({{ day.event_count }} events)
+      {% for event in day.events %}
+      - [{{ event.type }}] {{ event.title }}{% if event.summary %} — {{ event.summary }}{% endif %}
+        {% if event.concepts %}Concepts: {{ event.concepts | join(', ') }}{% endif %}
+
+      {% endfor %}
+      {% if day.decisions %}
+      **Decisions made this day:**
+      {% for d in day.decisions %}
+      - {{ d.title }}{% if d.reasoning %} — *{{ d.reasoning }}*{% endif %}{% if d.alternatives %} (over: {{ d.alternatives }}){% endif %}
+
+      {% endfor %}
+      {% endif %}
+      {% if day.new_concepts %}
+      **New concepts introduced**: {{ day.new_concepts | join(', ') }}
+      {% endif %}
+      {% endfor %}
+
+      ## One-Hit Wonders (appeared exactly once, never revisited)
+      {{ one_hit_wonders | join(', ') }}
+
+      ## Concept Links (cross-project connections)
+      {% for link in concept_links %}
+      - {{ link.a }} → {{ link.b }} ({{ link.relationship }}){% if link.evidence %}: {{ link.evidence }}{% endif %}
+      {% endfor %}
+
+      ---
+
+      Write the narrative of this project's intellectual journey.

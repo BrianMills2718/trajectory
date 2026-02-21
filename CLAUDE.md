@@ -125,10 +125,12 @@ Multi-level extraction validated across 3 diverse project types:
 - Digest generation for daily/weekly summaries (deferred)
 
 **Phase 4 Visualization Spikes (next):**
-- Concept heatmap grid — DONE (`trajectory/output/concept_heatmap.py`). PoC on agent_ontology. Auto-granularity (day/week/month), per-level color ramps (blue=themes, purple=design_bets, green=techniques), p5/p95 outlier trimming for long spans, labeled legend. CLI: `python -m trajectory.cli heatmap <project> [--max-concepts 40]`
-- Code DNA strip (1 session spike)
-- Concept half-life chart (1 session spike)
-- D3.js interactive force graph (2-3 session PoC)
+- Concept heatmap grid — DONE (`trajectory/output/concept_heatmap.py`). Auto-granularity, per-level color ramps, interactive HTML mode. CLI: `heatmap <project> [--max-concepts 40] [--html]`
+- Project wrapped — DONE (`trajectory/output/project_wrapped.py`). Spotify Wrapped-style insight cards. CLI: `wrapped <project>`
+- Concept evolution — DONE (`trajectory/output/concept_evolution.py`). Animated D3.js force graph with beats, narrative moments, auto-camera. CLI: `evolution <project>`
+- Project narrative — DONE (`trajectory/output/project_narrative.py`). LLM-synthesized story of a project's intellectual journey. Gathers events/concepts/decisions, feeds to LLM via Jinja2 prompt, renders dark-themed HTML. CLI: `narrative <project> [--model ...]`
+- Code DNA strip (deferred)
+- Concept half-life chart (deferred)
 - See `docs/VISUALIZATION_EXPERIMENTS.md` for full backlog + dependency graph
 
 ## Architecture
@@ -142,7 +144,7 @@ trajectory/
 │   ├── models.py                  # All Pydantic models
 │   ├── db.py                      # TrajectoryDB class — SQLite wrapper with all operations
 │   ├── ingest.py                  # Orchestrator: runs extractors, dedup, stores events
-│   ├── cli.py                     # CLI: ingest, analyze, stats, query, extract-tech, extract-patterns, extract-deps, rollup, heatmap, mural, dataflow
+│   ├── cli.py                     # CLI: ingest, analyze, stats, query, extract-tech, extract-patterns, extract-deps, rollup, heatmap, wrapped, evolution, narrative, mural, dataflow
 │   ├── mcp_server.py              # MCP server — 8 tools
 │   ├── extractors/
 │   │   ├── base.py                # BaseExtractor ABC
@@ -160,7 +162,10 @@ trajectory/
 │   │   └── concept_linker.py      # Cross-project concept linking
 │   └── output/
 │       ├── query_engine.py        # NL query → SQL → LLM synthesis
-│       ├── concept_heatmap.py      # Concept heatmap grid (GitHub-squares style, auto-granularity)
+│       ├── concept_heatmap.py     # Concept heatmap grid (GitHub-squares style, auto-granularity)
+│       ├── concept_evolution.py   # Animated D3.js force graph with beats + narrative moments
+│       ├── project_wrapped.py     # Spotify Wrapped-style insight cards
+│       ├── project_narrative.py   # LLM-synthesized project story → HTML
 │       ├── mural.py               # AI art mural generator (themes × months + dataflow)
 │       └── wrapped.py             # Developer Wrapped card (treemap + heatmap)
 ├── data/
@@ -170,6 +175,7 @@ trajectory/
 │   ├── concept_linking.yaml       # Jinja2 template for concept linking
 │   ├── session_classification.yaml # Jinja2 template for session-level analysis
 │   ├── event_classification.yaml  # Jinja2 template for event-level analysis
+│   ├── project_narrative.yaml      # Jinja2 template for project narrative synthesis
 │   ├── mural_tile.yaml            # Jinja2 template for mural art prompts
 │   ├── dataflow_layout.yaml       # LLM generates dataflow graph as JSON
 │   └── dataflow_tile.yaml         # Literal software-process tile prompts
@@ -257,7 +263,15 @@ python -m trajectory.cli rollup                    # concept activity + importan
 
 # Concept heatmap (GitHub-squares style)
 python -m trajectory.cli heatmap agent_ontology    # single project
-python -m trajectory.cli heatmap agent_ontology --max-concepts 60
+python -m trajectory.cli heatmap agent_ontology --max-concepts 60 --html
+
+# Project narrative (LLM-synthesized story)
+python -m trajectory.cli narrative agent_ontology
+python -m trajectory.cli narrative agent_ontology --model gemini/gemini-2.5-flash
+
+# Other visualizations
+python -m trajectory.cli wrapped agent_ontology    # Wrapped-style insight cards
+python -m trajectory.cli evolution agent_ontology  # Animated concept graph
 
 # Generate AI art mural (themes × months, PCA-positioned)
 python -m trajectory.cli mural --dry-run          # preview layout + prompts

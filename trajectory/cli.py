@@ -124,6 +124,15 @@ def main() -> None:
     evo_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     evo_parser.add_argument("project", help="Project name (as stored in trajectory DB)")
 
+    # narrative command — LLM-synthesized project story
+    narr_parser = sub.add_parser("narrative", help="Generate LLM-synthesized project narrative")
+    narr_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    narr_parser.add_argument("project", help="Project name (as stored in trajectory DB)")
+    narr_parser.add_argument(
+        "--model", type=str, default=None,
+        help="LLM model for synthesis (default: gemini-2.5-flash)",
+    )
+
     # dataflow command — single-project dataflow mural
     df_parser = sub.add_parser("dataflow", help="Generate single-project dataflow mural")
     df_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
@@ -335,6 +344,15 @@ def main() -> None:
             from trajectory.output.concept_evolution import generate_concept_evolution
 
             path = generate_concept_evolution(db, project_name=args.project)
+            print(f"Output: {path}")
+
+        elif args.command == "narrative":
+            from trajectory.output.project_narrative import generate_narrative
+
+            kwargs = {}
+            if args.model:
+                kwargs["model"] = args.model
+            path = generate_narrative(db, project_name=args.project, **kwargs)
             print(f"Output: {path}")
 
         elif args.command == "mural":
