@@ -81,6 +81,41 @@ def main() -> None:
         help="Show layout and prompts without generating images",
     )
 
+    # extract-tech command
+    tech_parser = sub.add_parser("extract-tech", help="Extract technologies from file extensions + deps")
+    tech_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    tech_parser.add_argument(
+        "project_path",
+        nargs="?",
+        help="Path to a specific project. If omitted, extracts for all projects.",
+    )
+
+    # extract-patterns command
+    wp_parser = sub.add_parser("extract-patterns", help="Extract work patterns from conversation events")
+    wp_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    wp_parser.add_argument(
+        "project_path",
+        nargs="?",
+        help="Path to a specific project. If omitted, extracts for all projects.",
+    )
+
+    # extract-deps command
+    dep_parser = sub.add_parser("extract-deps", help="Extract cross-project dependencies")
+    dep_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+
+    # rollup command
+    rollup_parser = sub.add_parser("rollup", help="Materialize concept activity + importance + lifecycle")
+    rollup_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+
+    # dataflow command — single-project dataflow mural
+    df_parser = sub.add_parser("dataflow", help="Generate single-project dataflow mural")
+    df_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    df_parser.add_argument("project", help="Project name (as stored in trajectory DB)")
+    df_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show layout and prompts without generating images",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -182,6 +217,86 @@ def main() -> None:
                     f"last ingested: {p.last_ingested}"
                 )
 
+        elif args.command == "extract-tech":
+            from trajectory.extractors.tech_extractor import (
+                extract_all_technologies,
+                extract_technologies,
+            )
+
+            if args.project_path:
+                project = db.get_project_by_path(str(Path(args.project_path).resolve()))
+                if not project:
+                    print(f"Project not found. Run 'ingest' first for {args.project_path}")
+                    return
+                result = extract_technologies(db, project.id, Path(args.project_path).resolve())
+                print(result)
+                # Show breakdown
+                techs = db.get_technologies(project.id)
+                for t in techs:
+                    print(f"  {t['category']:10s} {t['technology']:20s} files={t['file_count']}")
+            else:
+                results = extract_all_technologies(db)
+                for r in results:
+                    print(r)
+                print(f"\nTotal: {len(results)} projects")
+
+        elif args.command == "extract-patterns":
+            from trajectory.extractors.work_pattern_extractor import (
+                extract_all_work_patterns,
+                extract_work_patterns,
+            )
+
+            if args.project_path:
+                project = db.get_project_by_path(str(Path(args.project_path).resolve()))
+                if not project:
+                    print(f"Project not found. Run 'ingest' first for {args.project_path}")
+                    return
+                result = extract_work_patterns(db, project.id)
+                print(result)
+            else:
+                results = extract_all_work_patterns(db)
+                for r in results:
+                    print(r)
+                total_msgs = sum(r.total_messages for r in results)
+                total_toks = sum(r.total_tokens for r in results)
+                print(f"\nTotal: {len(results)} projects, {total_msgs} messages, {total_toks} tokens")
+
+        elif args.command == "extract-deps":
+            from trajectory.extractors.dep_extractor import extract_dependencies
+
+            result = extract_dependencies(db)
+            print(result)
+
+            # Show cross-project links
+            rows = db.conn.execute(
+                """SELECT p1.name AS from_proj, p2.name AS to_proj, pd.dep_type, pd.evidence
+                   FROM project_dependencies pd
+                   JOIN projects p1 ON pd.project_id = p1.id
+                   LEFT JOIN projects p2 ON pd.depends_on_project_id = p2.id
+                   WHERE pd.depends_on_project_id IS NOT NULL
+                   ORDER BY p1.name"""
+            ).fetchall()
+            if rows:
+                print(f"\nCross-project links ({len(rows)}):")
+                for r in rows:
+                    print(f"  {r['from_proj']} → {r['to_proj']} ({r['dep_type']})")
+
+        elif args.command == "rollup":
+            from trajectory.extractors.concept_rollup import rollup_concept_activity
+
+            result = rollup_concept_activity(db)
+            print(result)
+
+            # Show top concepts by importance
+            top = db.conn.execute(
+                "SELECT name, importance, lifecycle, level FROM concepts "
+                "WHERE importance IS NOT NULL ORDER BY importance DESC LIMIT 15"
+            ).fetchall()
+            if top:
+                print("\nTop 15 concepts by importance:")
+                for c in top:
+                    print(f"  {c['importance']:6.1f}  {c['lifecycle']:10s}  [{c['level'] or '?':12s}]  {c['name']}")
+
         elif args.command == "mural":
             from trajectory.output.mural import generate_mural
 
@@ -192,6 +307,17 @@ def main() -> None:
                 db, config,
                 themes=theme_list,
                 months=month_list,
+                dry_run=args.dry_run,
+            )
+            if not args.dry_run:
+                print(f"Output: {result.output_dir}")
+
+        elif args.command == "dataflow":
+            from trajectory.output.mural import generate_project_mural
+
+            result = generate_project_mural(
+                db, config,
+                project_name=args.project,
                 dry_run=args.dry_run,
             )
             if not args.dry_run:

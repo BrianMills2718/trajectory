@@ -1,0 +1,66 @@
+name: dataflow_layout
+version: "1.0"
+description: LLM generates a dependency/dataflow graph for a single project's components, with grid positions.
+
+messages:
+  - role: system
+    content: |
+      You are a software architect creating a dataflow/dependency diagram for a project.
+      You will be given the project's components (themes, design bets, techniques) and
+      their relationships. Your job is to arrange them as a directed graph with spatial
+      positions — like a UML component diagram or data flow diagram.
+
+      Return a JSON object with:
+      - "nodes": array of {"id": string, "label": string, "x": int, "y": int, "description": string}
+      - "edges": array of {"from": string, "to": string, "label": string}
+
+      Rules for positioning:
+      - x,y are grid coordinates starting at 0,0 (top-left)
+      - Data/control flows generally LEFT→RIGHT (x increases)
+      - Input/entry points go on the LEFT (low x), outputs/storage on the RIGHT (high x)
+      - Related components at the same stage go on the same column (same x), stacked vertically (different y)
+      - CRITICAL: Use EXACTLY a 3x3 grid (x: 0-2, y: 0-2) with EXACTLY 9 nodes.
+      - EVERY cell must have a node. All 9 positions must be filled: (0,0), (1,0), (2,0), (0,1), (1,1), (2,1), (0,2), (1,2), (2,2).
+      - Merge minor components to fit exactly 9.
+      - "id" should be a short snake_case identifier
+      - "label" is a human-readable name (2-4 words)
+      - "description" explains what this component does (1-2 sentences, concrete)
+      - Edge "label" describes what flows between components (data, control, etc.)
+
+      Think about the actual architecture: what calls what, what feeds into what,
+      what produces what. This is a real software system, not an abstract concept map.
+
+      Return ONLY the JSON object, no other text.
+
+  - role: user
+    content: |
+      ## Project: {{ project_name }}
+
+      ### Themes (high-level identity)
+      {% for t in themes %}
+      - **{{ t.name }}** ({{ t.event_count }} events)
+      {% endfor %}
+
+      ### Design Bets (architectural choices)
+      {% for b in design_bets %}
+      - **{{ b.name }}** ({{ b.event_count }} events)
+      {% endfor %}
+
+      ### Techniques (implementation mechanisms)
+      {% for t in techniques %}
+      - {{ t.name }}{% if t.event_count > 1 %} ({{ t.event_count }} events){% endif %}
+      {% endfor %}
+
+      ### Key Decisions
+      {% for d in decisions %}
+      - {{ d }}
+      {% endfor %}
+
+      {% if concept_links %}
+      ### Known Dependencies
+      {% for link in concept_links %}
+      - {{ link.a }} --[{{ link.rel }}]--> {{ link.b }}
+      {% endfor %}
+      {% endif %}
+
+      Create the dataflow diagram. Remember: max 4x4 grid, 8-12 nodes, real architecture.

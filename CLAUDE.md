@@ -103,17 +103,33 @@ Multi-level extraction validated across 3 diverse project types:
 - CLI: `python -m trajectory.cli mural [--themes ...] [--months ...] [--dry-run]`
 - Dependencies: Pillow, google-genai
 
+**Deterministic Extractors (2026-02-20):** — COMPLETE
+- `trajectory/extractors/tech_extractor.py` — Languages, frameworks, tools from file extensions + pyproject.toml/package.json. Populates `project_technologies` table. 44 projects × ~10 techs each.
+- `trajectory/extractors/work_pattern_extractor.py` — Materializes session stats (message counts, token counts, tool usage, hour of day, day of week) from conversation event raw_data. Populates `work_patterns` table. 811 conversation events → 811 patterns.
+- `trajectory/extractors/dep_extractor.py` — Cross-project dependencies from pyproject.toml deps + `pip install -e` commands. Populates `project_dependencies` table. Found 4 cross-project links.
+- `trajectory/extractors/concept_rollup.py` — Materializes `concept_activity` (per-concept, per-month event counts), computes `concepts.importance` (log-scaled event count × significance × project span × recency), assigns `concepts.lifecycle` (emerging/growing/stable/declining/dormant). 1133 concepts scored.
+- CLI: `extract-tech`, `extract-patterns`, `extract-deps`, `rollup` subcommands.
+- All deterministic — zero LLM calls, zero cost.
+
+**Dataflow Mural + Wrapped Card** — EXPLORATORY
+- `trajectory/output/mural.py` — Extended with dataflow mode: LLM generates 3×3 dependency graph layout, generates tile per node.
+- `trajectory/output/wrapped.py` — Developer Wrapped card (1080×1920): treemap of themes, project×month heatmap, bold stats.
+- `prompts/dataflow_layout.yaml` — LLM generates dataflow graph as JSON (9 nodes, 3×3 grid).
+- `prompts/dataflow_tile.yaml` — Literal software-process image prompts.
+- CLI: `dataflow <project>` subcommand.
+- See `docs/VISUALIZATION_EXPERIMENTS.md` for full experiment tracking and backlog.
+
 ### What's NOT Built Yet
 
 **Phase 3 Remaining:**
 - Digest generation for daily/weekly summaries (deferred)
 
-**Phase 4 Remaining:**
-- Single-project dependency-graph mural (LLM generates layout from concept hierarchy, no time axis)
-- Stability AI seam blending integrated into pipeline (currently ad-hoc tested)
-- Literal software-process visuals (show actual YAML, JSON schemas, data flow — not metaphorical rooms)
-- `trajectory/output/html_timeline.py` — D3.js interactive timeline
-- `trajectory/output/markdown_exporter.py` — Narrative markdown reports
+**Phase 4 Visualization Spikes (next):**
+- Code DNA strip (1 session spike)
+- Concept half-life chart (1 session spike)
+- Concept heatmap grid (1 session spike)
+- D3.js interactive force graph (2-3 session PoC)
+- See `docs/VISUALIZATION_EXPERIMENTS.md` for full backlog + dependency graph
 
 ## Architecture
 
@@ -126,21 +142,26 @@ trajectory/
 │   ├── models.py                  # All Pydantic models
 │   ├── db.py                      # TrajectoryDB class — SQLite wrapper with all operations
 │   ├── ingest.py                  # Orchestrator: runs extractors, dedup, stores events
-│   ├── cli.py                     # CLI: ingest, analyze, stats, query, mural
+│   ├── cli.py                     # CLI: ingest, analyze, stats, query, extract-tech, extract-patterns, extract-deps, rollup, mural, dataflow
 │   ├── mcp_server.py              # MCP server — 8 tools
 │   ├── extractors/
 │   │   ├── base.py                # BaseExtractor ABC
 │   │   ├── git_extractor.py       # PyDriller commit extraction + diff summaries
 │   │   ├── claude_log_extractor.py # JSONL parser — enriched extraction + catch-all scanning
 │   │   ├── doc_extractor.py       # CLAUDE.md/STATUS.md/archive parser
-│   │   └── session_builder.py     # Links conversations to commits → work_sessions
+│   │   ├── session_builder.py     # Links conversations to commits → work_sessions
+│   │   ├── tech_extractor.py      # Deterministic: file extensions + pyproject.toml → technologies
+│   │   ├── work_pattern_extractor.py  # Deterministic: conversation raw_data → work patterns
+│   │   ├── dep_extractor.py       # Deterministic: pyproject.toml + pip install -e → project deps
+│   │   └── concept_rollup.py      # Deterministic: concept_activity + importance + lifecycle
 │   ├── analysis/
 │   │   ├── __init__.py
 │   │   ├── event_classifier.py    # Session-level + event-level LLM classification
 │   │   └── concept_linker.py      # Cross-project concept linking
 │   └── output/
 │       ├── query_engine.py        # NL query → SQL → LLM synthesis
-│       └── mural.py               # AI art mural generator (themes × months)
+│       ├── mural.py               # AI art mural generator (themes × months + dataflow)
+│       └── wrapped.py             # Developer Wrapped card (treemap + heatmap)
 ├── data/
 │   └── trajectory.db              # SQLite database (gitignored)
 ├── prompts/
@@ -148,7 +169,9 @@ trajectory/
 │   ├── concept_linking.yaml       # Jinja2 template for concept linking
 │   ├── session_classification.yaml # Jinja2 template for session-level analysis
 │   ├── event_classification.yaml  # Jinja2 template for event-level analysis
-│   └── mural_tile.yaml            # Jinja2 template for mural art prompts
+│   ├── mural_tile.yaml            # Jinja2 template for mural art prompts
+│   ├── dataflow_layout.yaml       # LLM generates dataflow graph as JSON
+│   └── dataflow_tile.yaml         # Literal software-process tile prompts
 ├── templates/                     # Empty — for D3.js HTML later
 └── tests/
     ├── conftest.py                # Shared fixtures (tmp_db, populated_db)
@@ -161,16 +184,20 @@ trajectory/
     └── test_session_builder.py    # 10 session builder tests
 ```
 
-## Database Schema (11 tables)
+## Database Schema (15 tables)
 
 - `projects` — tracked repos (name, path, git_remote, stats, last_ingested)
 - `events` — unified timeline (commit/conversation/doc_change/archive events with LLM analysis fields, diff_summary, change_types, session_id)
 - `work_sessions` — conversations linked to their commits (user_goal, tool_sequence, files_modified, commit_hashes, assistant_reasoning, diff_summary)
 - `session_events` — junction table linking sessions to events with role (conversation/commit)
-- `concepts` — ideas/patterns that emerge and evolve (name, level, level_rationale, status, first_seen, last_seen)
+- `concepts` — ideas/patterns that emerge and evolve (name, level, level_rationale, status, first_seen, last_seen, importance, lifecycle)
 - `concept_events` — links events to concepts with relationship type and confidence
+- `concept_activity` — per-concept, per-month event counts + avg significance + project count (materialized)
 - `decisions` — architectural/design decisions extracted from events
 - `concept_links` — cross-concept relationships (depends_on, evolved_from, etc.)
+- `project_technologies` — languages, frameworks, tools per project (deterministic, from file extensions + deps)
+- `project_dependencies` — cross-project + external deps (from pyproject.toml + pip install -e)
+- `work_patterns` — per-conversation materialized stats (message counts, token counts, tool usage, timing)
 - `analysis_runs` — provenance (model, prompt_version, cost, status)
 - `corrections` — user correction audit trail
 - `digests` — generated daily/weekly summaries
@@ -219,6 +246,13 @@ python -m trajectory.cli query "How has the ontology idea evolved?"
 
 # Show stats
 python -m trajectory.cli stats
+
+# Deterministic extractors (no LLM, zero cost)
+python -m trajectory.cli extract-tech              # all projects
+python -m trajectory.cli extract-tech /home/brian/projects/sam_gov
+python -m trajectory.cli extract-patterns          # all projects
+python -m trajectory.cli extract-deps              # cross-project deps
+python -m trajectory.cli rollup                    # concept activity + importance + lifecycle
 
 # Generate AI art mural (themes × months, PCA-positioned)
 python -m trajectory.cli mural --dry-run          # preview layout + prompts

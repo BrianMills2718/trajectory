@@ -170,6 +170,67 @@ CREATE INDEX IF NOT EXISTS idx_digests_type_period ON digests(digest_type, perio
 CREATE INDEX IF NOT EXISTS idx_work_sessions_project ON work_sessions(project_id);
 CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_events_event ON session_events(event_id);
+
+CREATE TABLE IF NOT EXISTS project_technologies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    technology TEXT NOT NULL,
+    category TEXT NOT NULL,
+    file_count INTEGER DEFAULT 0,
+    first_seen TEXT,
+    last_seen TEXT,
+    UNIQUE(project_id, technology)
+);
+
+CREATE TABLE IF NOT EXISTS project_dependencies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    depends_on_project_id INTEGER REFERENCES projects(id),
+    depends_on_name TEXT NOT NULL,
+    dep_type TEXT NOT NULL,
+    evidence TEXT,
+    UNIQUE(project_id, depends_on_name)
+);
+
+CREATE TABLE IF NOT EXISTS work_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES events(id) UNIQUE,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    duration_minutes REAL,
+    message_count INTEGER DEFAULT 0,
+    user_message_count INTEGER DEFAULT 0,
+    total_input_tokens INTEGER DEFAULT 0,
+    total_output_tokens INTEGER DEFAULT 0,
+    tool_read_count INTEGER DEFAULT 0,
+    tool_write_count INTEGER DEFAULT 0,
+    tool_edit_count INTEGER DEFAULT 0,
+    tool_bash_count INTEGER DEFAULT 0,
+    tool_glob_count INTEGER DEFAULT 0,
+    tool_grep_count INTEGER DEFAULT 0,
+    tool_task_count INTEGER DEFAULT 0,
+    files_examined_count INTEGER DEFAULT 0,
+    files_modified_count INTEGER DEFAULT 0,
+    hour_of_day INTEGER,
+    day_of_week INTEGER,
+    model TEXT
+);
+
+CREATE TABLE IF NOT EXISTS concept_activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    concept_id INTEGER NOT NULL REFERENCES concepts(id),
+    period TEXT NOT NULL,
+    event_count INTEGER DEFAULT 0,
+    avg_significance REAL,
+    projects_active INTEGER DEFAULT 0,
+    UNIQUE(concept_id, period)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_tech_project ON project_technologies(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_deps_project ON project_dependencies(project_id);
+CREATE INDEX IF NOT EXISTS idx_work_patterns_project ON work_patterns(project_id);
+CREATE INDEX IF NOT EXISTS idx_work_patterns_hour ON work_patterns(hour_of_day);
+CREATE INDEX IF NOT EXISTS idx_concept_activity_concept ON concept_activity(concept_id);
+CREATE INDEX IF NOT EXISTS idx_concept_activity_period ON concept_activity(period);
 """
 
 
@@ -201,6 +262,8 @@ class TrajectoryDB:
             ("events", "diff_summary TEXT"),
             ("events", "change_types TEXT"),
             ("events", "session_id INTEGER REFERENCES work_sessions(id)"),
+            ("concepts", "importance REAL"),
+            ("concepts", "lifecycle TEXT"),
         ]
         for table, col in migrations:
             try:
@@ -942,6 +1005,178 @@ class TrajectoryDB:
         )
         self.conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
+
+    # --- Technology operations ---
+
+    def upsert_technology(
+        self,
+        project_id: int,
+        technology: str,
+        category: str,
+        file_count: int = 0,
+        first_seen: str | None = None,
+        last_seen: str | None = None,
+    ) -> int:
+        """Insert or update a project technology. Returns row ID."""
+        row = self.conn.execute(
+            "SELECT id, first_seen FROM project_technologies WHERE project_id = ? AND technology = ?",
+            (project_id, technology),
+        ).fetchone()
+        if row:
+            updates = ["category = ?", "file_count = ?"]
+            params: list[str | int] = [category, file_count]
+            if last_seen:
+                updates.append("last_seen = ?")
+                params.append(last_seen)
+            if first_seen and (not row["first_seen"] or first_seen < row["first_seen"]):
+                updates.append("first_seen = ?")
+                params.append(first_seen)
+            params.append(row["id"])
+            self.conn.execute(
+                f"UPDATE project_technologies SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            return row["id"]
+        cursor = self.conn.execute(
+            "INSERT INTO project_technologies (project_id, technology, category, file_count, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
+            (project_id, technology, category, file_count, first_seen, last_seen),
+        )
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    def get_technologies(self, project_id: int | None = None) -> list[dict[str, object]]:
+        """Get technologies, optionally filtered by project."""
+        if project_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM project_technologies WHERE project_id = ? ORDER BY category, technology",
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM project_technologies ORDER BY project_id, category, technology"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_technologies(self, project_id: int) -> int:
+        """Delete all technologies for a project. Returns count deleted."""
+        count = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM project_technologies WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()["cnt"]
+        self.conn.execute(
+            "DELETE FROM project_technologies WHERE project_id = ?",
+            (project_id,),
+        )
+        self.conn.commit()
+        return count
+
+    # --- Work pattern operations ---
+
+    def upsert_work_pattern(
+        self,
+        event_id: int,
+        project_id: int,
+        **kwargs: object,
+    ) -> int:
+        """Insert or update a work pattern row. Returns row ID."""
+        row = self.conn.execute(
+            "SELECT id FROM work_patterns WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if row:
+            if kwargs:
+                sets = ", ".join(f"{k} = ?" for k in kwargs)
+                self.conn.execute(
+                    f"UPDATE work_patterns SET {sets} WHERE id = ?",
+                    [*kwargs.values(), row["id"]],
+                )
+            return row["id"]
+        cols = ["event_id", "project_id"] + list(kwargs.keys())
+        placeholders = ", ".join("?" * len(cols))
+        cursor = self.conn.execute(
+            f"INSERT INTO work_patterns ({', '.join(cols)}) VALUES ({placeholders})",
+            [event_id, project_id, *kwargs.values()],
+        )
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    def get_work_patterns(
+        self,
+        project_id: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, object]]:
+        """Get work patterns, optionally filtered by project."""
+        if project_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM work_patterns WHERE project_id = ? ORDER BY id LIMIT ?",
+                (project_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM work_patterns ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Concept activity operations ---
+
+    def upsert_concept_activity(
+        self,
+        concept_id: int,
+        period: str,
+        event_count: int,
+        avg_significance: float | None = None,
+        projects_active: int = 0,
+    ) -> int:
+        """Insert or update a concept activity row. Returns row ID."""
+        row = self.conn.execute(
+            "SELECT id FROM concept_activity WHERE concept_id = ? AND period = ?",
+            (concept_id, period),
+        ).fetchone()
+        if row:
+            self.conn.execute(
+                "UPDATE concept_activity SET event_count = ?, avg_significance = ?, projects_active = ? WHERE id = ?",
+                (event_count, avg_significance, projects_active, row["id"]),
+            )
+            return row["id"]
+        cursor = self.conn.execute(
+            "INSERT INTO concept_activity (concept_id, period, event_count, avg_significance, projects_active) VALUES (?, ?, ?, ?, ?)",
+            (concept_id, period, event_count, avg_significance, projects_active),
+        )
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    def get_concept_activity(
+        self,
+        concept_id: int | None = None,
+        period: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Get concept activity rows with optional filters."""
+        clauses: list[str] = []
+        params: list[int | str] = []
+        if concept_id is not None:
+            clauses.append("concept_id = ?")
+            params.append(concept_id)
+        if period is not None:
+            clauses.append("period = ?")
+            params.append(period)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM concept_activity {where} ORDER BY concept_id, period",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_concept_importance(self, concept_id: int, importance: float) -> None:
+        """Set the computed importance score on a concept."""
+        self.conn.execute(
+            "UPDATE concepts SET importance = ? WHERE id = ?",
+            (importance, concept_id),
+        )
+
+    def update_concept_lifecycle(self, concept_id: int, lifecycle: str) -> None:
+        """Set the lifecycle stage on a concept."""
+        self.conn.execute(
+            "UPDATE concepts SET lifecycle = ? WHERE id = ?",
+            (lifecycle, concept_id),
+        )
 
     # --- Helpers ---
 

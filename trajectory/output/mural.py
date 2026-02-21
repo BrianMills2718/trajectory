@@ -1,9 +1,9 @@
-"""Mural generator v2 — LLM-planned layout, corner-out generation.
+"""Mural generator — two modes:
 
-The LLM arranges themes into a conceptual vertical order based on their
-relationships. Tiles are generated in scanline order (top-left → right
-→ next row) so each tile's prompt can reference already-generated
-neighbors, producing a coherent flowing mural.
+1. Multi-project theme×month grid (generate_mural)
+2. Single-project dataflow diagram (generate_project_mural)
+
+Both use LLM-planned layout and corner-out scanline generation.
 """
 
 import io
@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from google import genai
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from llm_client import call_llm, render_prompt
 
@@ -361,6 +361,55 @@ def assemble_mural(
     return mural, canvas_w, canvas_h
 
 
+def smooth_seams(
+    mural: Image.Image,
+    n_rows: int,
+    n_cols: int,
+    tile_size: int,
+    overlap: int,
+    blur_radius: int = 12,
+) -> Image.Image:
+    """Apply Gaussian blur along seam lines to smooth tile boundaries.
+
+    Creates a blurred copy of the full mural, then composites the blurred version
+    only in narrow strips along the seam center lines, with a feathered mask so the
+    blur fades into the sharp original.
+    """
+    step = tile_size - overlap
+    w, h = mural.size
+
+    blurred = mural.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # Build a mask: white = use blurred, black = use original
+    seam_mask = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(seam_mask)
+
+    seam_width = overlap // 2  # width of the blurred seam strip
+
+    # Vertical seams (between columns)
+    for col in range(1, n_cols):
+        cx = col * step
+        draw.rectangle(
+            [(cx - seam_width // 2, 0), (cx + seam_width // 2, h)],
+            fill=255,
+        )
+
+    # Horizontal seams (between rows)
+    for row in range(1, n_rows):
+        cy = row * step
+        draw.rectangle(
+            [(0, cy - seam_width // 2), (w, cy + seam_width // 2)],
+            fill=255,
+        )
+
+    # Feather the seam mask so blur fades in smoothly
+    seam_mask = seam_mask.filter(ImageFilter.GaussianBlur(radius=seam_width // 2))
+
+    # Composite: original where mask is black, blurred where mask is white
+    result = Image.composite(blurred, mural, seam_mask)
+    return result
+
+
 def add_timeline_bar(
     mural: Image.Image,
     months: list[str],
@@ -595,5 +644,349 @@ def generate_mural(
         for err in result.errors:
             print(f"  - {err}")
     print(f"Estimated cost: ${result.total_cost:.2f}")
+
+    return result
+
+
+# ============================================================
+# Single-project dataflow mural
+# ============================================================
+
+
+@dataclass
+class DataflowNode:
+    """A component in the dataflow graph."""
+
+    id: str
+    label: str
+    x: int  # grid column
+    y: int  # grid row
+    description: str
+    techniques: list[str] = field(default_factory=list)
+    art_prompt: str = ""
+    image: Image.Image | None = None
+
+
+@dataclass
+class DataflowEdge:
+    """A directed edge in the dataflow graph."""
+
+    from_id: str
+    to_id: str
+    label: str
+
+
+@dataclass
+class DataflowResult:
+    """Output of a single-project dataflow mural."""
+
+    project: str
+    nodes: list[DataflowNode]
+    edges: list[DataflowEdge]
+    n_rows: int
+    n_cols: int
+    canvas_size: tuple[int, int]
+    output_dir: Path
+    total_cost: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+def query_project_data(db: TrajectoryDB, project_name: str) -> dict:
+    """Gather all concept data for a single project."""
+    proj = db.conn.execute(
+        "SELECT id FROM projects WHERE name = ?", (project_name,)
+    ).fetchone()
+    if not proj:
+        raise ValueError(f"Project not found: {project_name}")
+    pid = proj["id"]
+
+    result: dict = {"themes": [], "design_bets": [], "techniques": [], "decisions": [], "concept_links": []}
+
+    for level in ("theme", "design_bet", "technique"):
+        rows = db.conn.execute(
+            """SELECT c.id, c.name, COUNT(ce.event_id) as event_count
+               FROM concepts c
+               JOIN concept_events ce ON c.id = ce.concept_id
+               JOIN events e ON ce.event_id = e.id
+               WHERE c.level = ? AND e.project_id = ?
+               GROUP BY c.id ORDER BY event_count DESC""",
+            (level, pid),
+        ).fetchall()
+        key = level + "s" if level != "technique" else "techniques"
+        result[key] = [{"name": r["name"], "event_count": r["event_count"]} for r in rows]
+
+    # Decisions
+    decs = db.conn.execute(
+        """SELECT DISTINCT d.title FROM decisions d
+           JOIN events e ON d.event_id = e.id
+           WHERE e.project_id = ? LIMIT 20""",
+        (pid,),
+    ).fetchall()
+    result["decisions"] = [d["title"] for d in decs]
+
+    # Concept links involving this project's concepts
+    links = db.conn.execute(
+        """SELECT c1.name as a_name, cl.relationship, c2.name as b_name
+           FROM concept_links cl
+           JOIN concepts c1 ON cl.concept_a_id = c1.id
+           JOIN concepts c2 ON cl.concept_b_id = c2.id
+           WHERE c1.id IN (SELECT concept_id FROM concept_events ce JOIN events e ON ce.event_id=e.id WHERE e.project_id=?)
+              OR c2.id IN (SELECT concept_id FROM concept_events ce JOIN events e ON ce.event_id=e.id WHERE e.project_id=?)""",
+        (pid, pid),
+    ).fetchall()
+    result["concept_links"] = [{"a": l["a_name"], "rel": l["relationship"], "b": l["b_name"]} for l in links]
+
+    return result
+
+
+def plan_dataflow_layout(
+    project_name: str,
+    project_data: dict,
+    config: MuralConfig,
+) -> tuple[list[DataflowNode], list[DataflowEdge]]:
+    """Ask LLM to create a dataflow graph with spatial positions."""
+    messages = render_prompt(
+        PROMPTS_DIR / "dataflow_layout.yaml",
+        project_name=project_name,
+        themes=project_data["themes"],
+        design_bets=project_data["design_bets"],
+        techniques=project_data["techniques"],
+        decisions=project_data["decisions"],
+        concept_links=project_data["concept_links"],
+    )
+
+    result = call_llm(
+        config.prompt_model,
+        messages,
+        task="trajectory.mural.dataflow_layout",
+        trace_id=f"trajectory.mural.dataflow_layout.{project_name}",
+        max_budget=0,
+    )
+
+    content = result.content.strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1]
+        if content.endswith("```"):
+            content = content[:-3]
+
+    graph = json.loads(content)
+
+    # Build technique lookup by concept name
+    technique_by_name: dict[str, list[str]] = {}
+    for t in project_data["themes"]:
+        technique_by_name[t["name"]] = [
+            tech["name"] for tech in project_data["techniques"][:5]
+        ]
+
+    nodes = []
+    for n in graph["nodes"]:
+        node = DataflowNode(
+            id=n["id"],
+            label=n["label"],
+            x=n["x"],
+            y=n["y"],
+            description=n["description"],
+            techniques=technique_by_name.get(n["id"], []),
+        )
+        nodes.append(node)
+
+    edges = []
+    for e in graph["edges"]:
+        edges.append(DataflowEdge(from_id=e["from"], to_id=e["to"], label=e["label"]))
+
+    return nodes, edges
+
+
+def generate_dataflow_tile_prompt(
+    node: DataflowNode,
+    edges: list[DataflowEdge],
+    all_nodes: dict[str, DataflowNode],
+    config: MuralConfig,
+    neighbors: dict[str, str] | None = None,
+) -> str:
+    """Generate an art prompt for a dataflow node tile."""
+    # Find incoming/outgoing edges
+    edges_in = []
+    for e in edges:
+        if e.to_id == node.id and e.from_id in all_nodes:
+            edges_in.append({
+                "from_label": all_nodes[e.from_id].label,
+                "label": e.label,
+            })
+
+    edges_out = []
+    for e in edges:
+        if e.from_id == node.id and e.to_id in all_nodes:
+            edges_out.append({
+                "to_label": all_nodes[e.to_id].label,
+                "label": e.label,
+            })
+
+    messages = render_prompt(
+        PROMPTS_DIR / "dataflow_tile.yaml",
+        node_label=node.label,
+        node_description=node.description,
+        techniques=node.techniques,
+        edges_in=edges_in,
+        edges_out=edges_out,
+        neighbors=neighbors or {},
+    )
+
+    result = call_llm(
+        config.prompt_model,
+        messages,
+        task="trajectory.mural.dataflow_tile",
+        trace_id=f"trajectory.mural.dataflow_tile.{node.id}",
+        max_budget=0,
+    )
+
+    return f"{result.content.strip()} Style: {config.style_suffix}"
+
+
+def generate_project_mural(
+    db: TrajectoryDB,
+    config: Config,
+    project_name: str,
+    dry_run: bool = False,
+) -> DataflowResult:
+    """Generate a single-project dataflow mural."""
+    mc = config.mural
+
+    # Step 1: Query project data
+    logger.info("Querying data for %s...", project_name)
+    project_data = query_project_data(db, project_name)
+
+    print(f"Project: {project_name}")
+    print(f"  Themes: {len(project_data['themes'])}")
+    print(f"  Design bets: {len(project_data['design_bets'])}")
+    print(f"  Techniques: {len(project_data['techniques'])}")
+    print(f"  Decisions: {len(project_data['decisions'])}")
+    print(f"  Concept links: {len(project_data['concept_links'])}")
+
+    # Step 2: LLM generates dataflow layout
+    logger.info("Generating dataflow layout...")
+    nodes, edges = plan_dataflow_layout(project_name, project_data, mc)
+
+    # Build spatial index
+    node_by_id = {n.id: n for n in nodes}
+    node_at: dict[tuple[int, int], DataflowNode] = {(n.x, n.y): n for n in nodes}
+
+    n_cols = max(n.x for n in nodes) + 1
+    n_rows = max(n.y for n in nodes) + 1
+
+    print(f"\nDataflow graph: {len(nodes)} nodes, {len(edges)} edges")
+    print(f"Grid: {n_cols} cols x {n_rows} rows")
+    for node in sorted(nodes, key=lambda n: (n.y, n.x)):
+        print(f"  [{node.x},{node.y}] {node.label}: {node.description[:60]}...")
+
+    print(f"\nEdges:")
+    for edge in edges:
+        from_label = node_by_id[edge.from_id].label if edge.from_id in node_by_id else edge.from_id
+        to_label = node_by_id[edge.to_id].label if edge.to_id in node_by_id else edge.to_id
+        print(f"  {from_label} --[{edge.label}]--> {to_label}")
+
+    output_dir = config.resolved_db_path.parent / "mural"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tile_size = mc.tile_size
+    overlap = int(tile_size * mc.vertical_overlap)
+
+    # Step 3: Generate art prompts in scanline order (top-left → right → down)
+    scanline = sorted(nodes, key=lambda n: (n.y, n.x))
+
+    for node in scanline:
+        neighbors: dict[str, str] = {}
+        left = node_at.get((node.x - 1, node.y))
+        if left and left.art_prompt:
+            neighbors["left"] = left.art_prompt
+        above = node_at.get((node.x, node.y - 1))
+        if above and above.art_prompt:
+            neighbors["above"] = above.art_prompt
+
+        node.art_prompt = generate_dataflow_tile_prompt(
+            node, edges, node_by_id, mc, neighbors or None
+        )
+        logger.info("  Prompt [%d,%d] %s: %s...", node.x, node.y, node.label, node.art_prompt[:80])
+
+    # Compute canvas size
+    step = tile_size - overlap
+    canvas_w = tile_size + (n_cols - 1) * step
+    canvas_h = tile_size + (n_rows - 1) * step
+
+    result = DataflowResult(
+        project=project_name,
+        nodes=nodes,
+        edges=edges,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        canvas_size=(canvas_w, canvas_h),
+        output_dir=output_dir,
+    )
+
+    if dry_run:
+        print(f"\nCanvas: {canvas_w} x {canvas_h} px")
+        print(f"Overlap: {overlap} px")
+        print()
+        for node in scanline:
+            print(f"[{node.x},{node.y}] {node.label}:")
+            print(f"  {node.art_prompt[:120]}...")
+            print()
+        return result
+
+    # Step 4: Generate images
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY not found. Ensure llm_client is imported or set the env var."
+        )
+    client = genai.Client(api_key=api_key)
+
+    for node in scanline:
+        logger.info("Generating [%d,%d] %s", node.x, node.y, node.label)
+        try:
+            img = generate_tile_image(node.art_prompt, mc, client)
+            node.image = img
+
+            safe_name = node.id.replace("/", "_").replace(" ", "_")
+            tile_path = output_dir / f"df_{node.x}_{node.y}_{safe_name}.png"
+            img.save(str(tile_path))
+            print(f"  Generated: {tile_path}")
+
+        except Exception as e:
+            error_msg = f"[{node.x},{node.y}] {node.label}: {e}"
+            logger.error(error_msg)
+            result.errors.append(error_msg)
+
+    # Step 5: Assemble — convert nodes to GridCell for reuse
+    grid_cells = []
+    for node in nodes:
+        if node.image is not None:
+            cell = GridCell(
+                data=ThemeTile(
+                    theme=node.label, month="", activity="active",
+                    techniques=[], design_bets=[], decisions=[], event_count=0,
+                ),
+                row=node.y,
+                col=node.x,
+                image=node.image,
+            )
+            grid_cells.append(cell)
+
+    mural_img, canvas_w, canvas_h = assemble_mural(
+        grid_cells, n_rows, n_cols, tile_size, overlap
+    )
+    mural_img = smooth_seams(mural_img, n_rows, n_cols, tile_size, overlap)
+    result.canvas_size = (canvas_w, canvas_h)
+
+    mural_path = output_dir / f"dataflow_{project_name}.png"
+    mural_img.save(str(mural_path))
+
+    generated_count = sum(1 for n in nodes if n.image is not None)
+    print(f"\nDataflow mural: {mural_path}")
+    print(f"Tiles: {generated_count}/{len(nodes)} generated")
+    if result.errors:
+        print(f"Errors: {len(result.errors)}")
+        for err in result.errors:
+            print(f"  - {err}")
 
     return result

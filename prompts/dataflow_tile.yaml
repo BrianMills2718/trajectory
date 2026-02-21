@@ -1,0 +1,59 @@
+name: dataflow_tile
+version: "1.0"
+description: Generate a literal software-process image prompt for one node in a dataflow diagram.
+
+messages:
+  - role: system
+    content: |
+      You are creating a prompt for AI image generation. Each tile represents one REAL
+      software component. You must depict it AS LITERALLY AS POSSIBLE — show what the
+      software actually does, not a metaphor for it.
+
+      Your output is a single paragraph (60-100 words) describing the image.
+
+      LITERAL depictions — show the actual software artifacts:
+      - Template rendering → show YAML/Jinja2 code being filled in with variables, arrows from input data to rendered output
+      - JSON schema validation → show a JSON document next to a schema with checkmarks/X marks on each field
+      - Provider routing → show a switchboard/router with labeled paths to different API endpoints
+      - Logging/observability → show log lines, dashboards, cost counters, trace timelines
+      - Budget checking → show a ledger with running totals, threshold lines, pass/fail indicators
+      - Cost tracking → show a spreadsheet or receipt with itemized costs per model/call
+      - Retry logic → show a flowchart: try → fail → wait → retry, with attempt counters
+      - Caching → show a cache hit/miss diagram with keys and stored values
+      - Tool calling → show function signatures being mapped to JSON schemas, request/response pairs
+
+      Include the component name as readable text in the image — on a title bar, header,
+      label, or tab. Like a software window or dashboard title.
+
+      CRITICAL — neighbor continuity:
+      If neighbor descriptions are provided, share visual elements at edges: connecting
+      wires, data flow arrows crossing the border, shared color gradients, pipeline tubes
+      running between tiles.
+
+      Do NOT include style instructions in your description.
+
+  - role: user
+    content: |
+      ## Component: {{ node_label }}
+      {{ node_description }}
+
+      {% if techniques %}
+      **Implementation details**: {{ techniques | join(', ') }}
+      {% endif %}
+
+      {% if edges_in %}
+      **Receives from**: {% for e in edges_in %}{{ e.from_label }} ({{ e.label }}){% if not loop.last %}, {% endif %}{% endfor %}
+      {% endif %}
+
+      {% if edges_out %}
+      **Sends to**: {% for e in edges_out %}{{ e.to_label }} ({{ e.label }}){% if not loop.last %}, {% endif %}{% endfor %}
+      {% endif %}
+
+      {% if neighbors %}
+      ## Neighboring Tiles (share visual elements at edges)
+      {% for direction, desc in neighbors.items() %}
+      - **{{ direction }}**: {{ desc }}
+      {% endfor %}
+      {% endif %}
+
+      Describe the image. Show literal software artifacts. The text "{{ node_label }}" must be readable in the image.
