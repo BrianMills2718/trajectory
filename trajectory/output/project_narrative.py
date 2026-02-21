@@ -176,6 +176,343 @@ def _gather_narrative_data(db: TrajectoryDB, project_id: int) -> dict:
     }
 
 
+def _build_version_content_for_llm(versions: list[dict]) -> str:
+    """Build a condensed summary of all versions for the concept extraction prompt.
+
+    Includes version number, word count, section headers, and a content excerpt.
+    Keeps total under ~8000 tokens by scaling excerpt length to version count.
+    """
+    # Scale excerpt size: fewer versions → more content per version
+    max_chars_per_version = min(1500, 8000 // max(len(versions), 1))
+
+    parts = []
+    for v in versions:
+        part = f"## V{v['number']}"
+        if v.get("note"):
+            part += f" — {v['note']}"
+        part += f"\n{v['word_count']} words"
+
+        delta = v.get("word_delta")
+        if delta:
+            part += f" ({'+' if delta > 0 else ''}{delta} from previous)"
+
+        if v.get("sections"):
+            part += f"\nSections: {', '.join(v['sections'][:8])}"
+
+        if v.get("added_sections"):
+            part += f"\nNew sections: {', '.join(v['added_sections'][:4])}"
+        if v.get("removed_sections"):
+            part += f"\nRemoved sections: {', '.join(v['removed_sections'][:4])}"
+
+        # Content excerpt — take from beginning and end for coverage
+        body = v["body"]
+        if len(body) > max_chars_per_version:
+            half = max_chars_per_version // 2
+            excerpt = body[:half] + "\n[...]\n" + body[-half:]
+        else:
+            excerpt = body
+        part += f"\nContent:\n{excerpt}"
+        parts.append(part)
+
+    return "\n\n---\n\n".join(parts)
+
+
+def generate_narrative_from_doc(
+    doc_path: str | Path,
+    name: str | None = None,
+    model: str = "gemini/gemini-2.5-flash",
+) -> Path:
+    """Generate a narrative from a versioned markdown document (no DB needed).
+
+    Parses version headers (# V1, # V2, etc.) as the timeline, extracts
+    content changes between versions, and feeds into the same two-pass
+    LLM narrative pipeline.
+    """
+    doc_path = Path(doc_path)
+    if not doc_path.exists():
+        raise FileNotFoundError(f"Document not found: {doc_path}")
+
+    project_name = name or doc_path.stem.replace(" ", "_")
+    text = doc_path.read_text(encoding="utf-8")
+
+    # Parse versions — split on # V<number> headers
+    version_pattern = re.compile(r"^# (V\d+.*?)$", re.MULTILINE)
+    splits = list(version_pattern.finditer(text))
+
+    if not splits:
+        raise ValueError("No version headers found (expected '# V1', '# V2', etc.)")
+
+    versions = []
+    for i, match in enumerate(splits):
+        header = match.group(1).strip()
+        start = match.end()
+        end = splits[i + 1].start() if i + 1 < len(splits) else len(text)
+        body = text[start:end].strip()
+
+        # Extract version number
+        vnum_match = re.match(r"V(\d+)", header)
+        vnum = int(vnum_match.group(1)) if vnum_match else i + 1
+
+        # Extract editorial note from header (e.g. "V28 - V27 refined")
+        note = header[len(f"V{vnum}"):].strip().lstrip("-").lstrip("\\-").strip()
+
+        # Word count and key phrases (first 3 section headers)
+        sections = re.findall(r"^#{2,4}\s+\*?\*?(.+?)\*?\*?\s*$", body, re.MULTILINE)
+        word_count = len(body.split())
+
+        versions.append({
+            "number": vnum,
+            "header": header,
+            "note": note,
+            "body": body,
+            "word_count": word_count,
+            "sections": sections[:8],
+        })
+
+    # Sort by version number (oldest first)
+    versions.sort(key=lambda v: v["number"])
+
+    logger.info(
+        "Parsed %d versions from %s (V%d → V%d, %d → %d words)",
+        len(versions), doc_path.name,
+        versions[0]["number"], versions[-1]["number"],
+        versions[0]["word_count"], versions[-1]["word_count"],
+    )
+
+    # --- Pass 0: Extract concepts and diffs across versions ---
+    # Compute what changed between consecutive versions
+    for i, v in enumerate(versions):
+        if i == 0:
+            v["added_sections"] = v["sections"][:]
+            v["removed_sections"] = []
+        else:
+            prev = versions[i - 1]
+            prev_set = set(s.lower().strip("* ") for s in prev["sections"])
+            curr_set = set(s.lower().strip("* ") for s in v["sections"])
+            v["added_sections"] = [s for s in v["sections"] if s.lower().strip("* ") not in prev_set]
+            v["removed_sections"] = [s for s in prev["sections"] if s.lower().strip("* ") not in curr_set]
+            v["word_delta"] = v["word_count"] - prev["word_count"]
+
+    # LLM concept extraction — ask the LLM to identify key concepts per version
+    logger.info("Extracting concepts across versions...")
+    concept_prompt = [
+        {"role": "system", "content": """You are analyzing how a document's IDEAS evolve across versions.
+
+For each version, identify 2-5 key concepts/ideas/framings present in that version.
+Track how concepts appear, evolve, merge, split, or get abandoned across versions.
+
+Return a JSON object:
+{
+  "concepts": [
+    {"name": "concept_name", "first_version": 1, "last_version": 31, "status": "survived|evolved|abandoned|merged",
+     "evolved_into": "other_concept_name or null", "description": "What this concept/framing is about"}
+  ],
+  "version_concepts": {
+    "1": ["concept_a", "concept_b"],
+    "5": ["concept_a", "concept_c"]
+  }
+}
+
+Guidelines:
+- Concepts are IDEAS and FRAMINGS, not section headers. Examples: "EPA role evolution", "personal data as moat", "CEO cloning metaphor", "attention economy critique"
+- Track when a concept gets REFRAMED (old concept abandoned, new one born from it)
+- 10-20 total concepts across all versions. Quality over quantity.
+- Use snake_case names that are descriptive"""},
+        {"role": "user", "content": _build_version_content_for_llm(versions)},
+    ]
+    concept_result = call_llm(
+        model, concept_prompt,
+        task="doc_concept_extraction",
+        trace_id=f"trajectory.doc_concepts.{project_name}",
+        max_budget=0,
+    )
+    concept_raw = concept_result.content.strip()
+    if concept_raw.startswith("```"):
+        concept_raw = re.sub(r"^```(?:json)?\s*", "", concept_raw)
+        concept_raw = re.sub(r"\s*```$", "", concept_raw)
+    concept_data = json.loads(concept_raw)
+
+    concepts = concept_data.get("concepts", [])
+    version_concepts = concept_data.get("version_concepts", {})
+    logger.info("Extracted %d concepts across %d versions", len(concepts), len(version_concepts))
+
+    # Build concept tracking data
+    concept_levels: dict[str, str] = {}
+    concept_mentions: Counter[str] = Counter()
+    for c in concepts:
+        status = c.get("status", "survived")
+        concept_levels[c["name"]] = "theme" if status in ("survived", "evolved") else "technique"
+        # Count mentions across versions
+        for vnum, vconcepts in version_concepts.items():
+            if c["name"] in vconcepts:
+                concept_mentions[c["name"]] += 1
+
+    one_hit_wonders = sorted(c for c, n in concept_mentions.items() if n == 1)
+
+    # Build "days" data with concepts
+    days = []
+    seen_concepts: set[str] = set()
+    for v in versions:
+        vnum_str = str(v["number"])
+        v_concepts = version_concepts.get(vnum_str, [])
+        new_concepts = [c for c in v_concepts if c not in seen_concepts]
+        seen_concepts.update(v_concepts)
+
+        events = [{
+            "type": "revision",
+            "title": f"Version {v['number']}" + (f": {v['note']}" if v['note'] else ""),
+            "summary": f"{v['word_count']} words. Sections: {', '.join(v['sections'][:5]) if v['sections'] else 'no headers'}",
+            "concepts": v_concepts,
+        }]
+        days.append({
+            "date": f"V{v['number']}",
+            "event_count": 1,
+            "events": events,
+            "decisions": [],
+            "new_concepts": new_concepts,
+        })
+
+    top_concepts = sorted(concepts, key=lambda c: concept_mentions.get(c["name"], 0), reverse=True)
+
+    data = {
+        "project_name": project_name,
+        "first_date": f"V{versions[0]['number']}",
+        "last_date": f"V{versions[-1]['number']}",
+        "total_days": len(versions),
+        "total_events": len(versions),
+        "total_concepts": len(concepts),
+        "total_decisions": 0,
+        "total_sessions": 0,
+        "top_concepts": [
+            {"name": c["name"], "level": concept_levels.get(c["name"], "theme"),
+             "importance": concept_mentions.get(c["name"], 1), "lifecycle": c.get("status", "unknown"),
+             "first_seen": f"V{c.get('first_version', '?')}", "last_seen": f"V{c.get('last_version', '?')}"}
+            for c in top_concepts[:25]
+        ],
+        "days": days,
+        "one_hit_wonders": one_hit_wonders,
+        "concept_links": [],
+        "concept_levels": concept_levels,
+    }
+
+    # Build rich version summaries with concept + diff data
+    version_summaries = []
+    for v in versions:
+        vnum_str = str(v["number"])
+        v_concepts = version_concepts.get(vnum_str, [])
+        preview = v["body"][:800].replace("\n", " ").strip()
+        added = v.get("added_sections", [])
+        removed = v.get("removed_sections", [])
+        delta = v.get("word_delta", 0)
+
+        summary = f"### V{v['number']}" + (f" ({v['note']})" if v['note'] else "")
+        summary += f"\n{v['word_count']} words"
+        if delta:
+            summary += f" ({'+' if delta > 0 else ''}{delta})"
+        summary += f". Sections: {', '.join(v['sections'][:6])}"
+        if added:
+            summary += f"\nAdded sections: {', '.join(added[:4])}"
+        if removed:
+            summary += f"\nRemoved sections: {', '.join(removed[:4])}"
+        if v_concepts:
+            summary += f"\nActive concepts: {', '.join(v_concepts)}"
+        summary += f"\nContent: {preview}..."
+        version_summaries.append(summary)
+
+    # --- Pass 1: Narrative with rich context ---
+    messages = [
+        {"role": "system", "content": """You are narrating the intellectual evolution of a written document across multiple versions.
+
+You have concept data showing how ideas appear, evolve, merge, and get abandoned across versions.
+Your job is to tell the STORY of this evolution — not as a changelog, but as an intellectual journey.
+
+Return a JSON object with this exact structure:
+{
+  "phases": [
+    {
+      "name": "Phase title",
+      "date_range": "V1-V5",
+      "color": "#58a6ff",
+      "event_count": 5,
+      "new_concept_count": 3,
+      "paragraphs": [
+        {"text": "Narrative paragraph...", "concepts_active": ["concept_name_1", "concept_name_2"]}
+      ],
+      "key_decision": {"title": "Key editorial decision", "tension": "What was at stake"}
+    }
+  ],
+  "arc_summary": "One paragraph summarizing the full evolutionary arc",
+  "epitaph": "One punchy sentence capturing what this document became"
+}
+
+Guidelines:
+- 3-6 phases grouping versions by major shifts in direction, framing, or audience
+- Each phase: 2-4 paragraphs telling the story. Reference specific version numbers.
+- concepts_active: list concept names that are relevant to each paragraph (these get highlighted as chips)
+- Focus on: framing shifts, audience changes, what got killed, what survived, breakthrough moments
+- Mention concepts by their exact names from the concept data
+- Phase colors: use visually distinct hex colors"""},
+        {"role": "user", "content": f"# Document: {project_name}\n\n"
+            + f"Versions: {len(versions)} (V{versions[0]['number']} → V{versions[-1]['number']})\n"
+            + f"Words: {versions[0]['word_count']} → {versions[-1]['word_count']}\n\n"
+            + "## Concept evolution\n"
+            + "\n".join(f"- **{c['name']}** (V{c.get('first_version','?')}→V{c.get('last_version','?')}, {c.get('status','?')}): {c.get('description','')}"
+                        + (f" → evolved into {c['evolved_into']}" if c.get('evolved_into') else "")
+                        for c in concepts)
+            + "\n\n## Version details\n\n"
+            + "\n\n".join(version_summaries)},
+    ]
+
+    logger.info("Calling LLM for document narrative (%s)...", model)
+    result = call_llm(
+        model, messages,
+        task="doc_narrative",
+        trace_id=f"trajectory.doc_narrative.{project_name}",
+        max_budget=0,
+    )
+
+    raw = result.content.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    narrative = json.loads(raw)
+    logger.info("Narrative: %d phases, cost: $%.4f", len(narrative.get("phases", [])), result.cost or 0)
+
+    # Pass 2: Journey diagram
+    logger.info("Generating journey diagram...")
+    diagram_messages = render_prompt(
+        PROMPTS_DIR / "narrative_diagram.yaml",
+        project_name=project_name,
+        phases=narrative.get("phases", []),
+        arc_summary=narrative.get("arc_summary", ""),
+        epitaph=narrative.get("epitaph", ""),
+        top_concepts=data.get("top_concepts", []),
+    )
+    diagram_result = call_llm(
+        model, diagram_messages,
+        task="doc_narrative_diagram",
+        trace_id=f"trajectory.doc_diagram.{project_name}",
+        max_budget=0,
+    )
+    diagram_raw = diagram_result.content.strip()
+    if diagram_raw.startswith("```"):
+        diagram_raw = re.sub(r"^```(?:json)?\s*", "", diagram_raw)
+        diagram_raw = re.sub(r"\s*```$", "", diagram_raw)
+    graph_data = json.loads(diagram_raw)
+    narrative["graph"] = graph_data
+    logger.info("Diagram: %d nodes, %d edges", len(graph_data.get("nodes", [])), len(graph_data.get("edges", [])))
+
+    html = _render_scrollytelling(project_name, data, narrative)
+
+    output_dir = Path(__file__).parent.parent.parent / "data" / "narratives"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{project_name}_narrative.html"
+    output_path.write_text(html, encoding="utf-8")
+
+    logger.info("Output: %s", output_path)
+    return output_path
+
+
 def generate_narrative(
     db: TrajectoryDB,
     project_name: str,

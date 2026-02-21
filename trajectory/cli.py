@@ -141,6 +141,14 @@ def main() -> None:
         help="Playback speed for video recording (default: 2x)",
     )
 
+    # doc-narrative command — narrative from a versioned document (no DB)
+    dn_parser = sub.add_parser("doc-narrative", help="Generate narrative from a versioned markdown document")
+    dn_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    dn_parser.add_argument("path", help="Path to versioned markdown file")
+    dn_parser.add_argument("--name", type=str, default=None, help="Display name (default: filename)")
+    dn_parser.add_argument("--model", type=str, default=None, help="LLM model")
+    dn_parser.add_argument("--video", action="store_true", help="Also record video")
+
     # supercut command — multi-project video trailer
     sc_parser = sub.add_parser("supercut", help="Generate multi-project narrative supercut video")
     sc_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
@@ -369,6 +377,21 @@ def main() -> None:
 
             path = generate_concept_evolution(db, project_name=args.project)
             print(f"Output: {path}")
+
+        elif args.command == "doc-narrative":
+            from trajectory.output.project_narrative import generate_narrative_from_doc, record_video
+
+            kwargs = {}
+            if args.model:
+                kwargs["model"] = args.model
+            if args.name:
+                kwargs["name"] = args.name
+            path = generate_narrative_from_doc(args.path, **kwargs)
+            print(f"Output: {path}")
+
+            if args.video:
+                video_path = record_video(path, speed=4.0)
+                print(f"Video: {video_path}")
 
         elif args.command == "narrative":
             from trajectory.output.project_narrative import generate_narrative
