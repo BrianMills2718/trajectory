@@ -114,6 +114,16 @@ def main() -> None:
     hm_parser.add_argument("--max-concepts", type=int, default=40, help="Max concept rows")
     hm_parser.add_argument("--html", action="store_true", help="Output interactive HTML instead of PNG")
 
+    # wrapped command — narrative insight cards
+    wrap_parser = sub.add_parser("wrapped", help="Generate project Wrapped page (narrative insights)")
+    wrap_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    wrap_parser.add_argument("project", help="Project name (as stored in trajectory DB)")
+
+    # evolution command — animated concept graph
+    evo_parser = sub.add_parser("evolution", help="Animated concept evolution timeline")
+    evo_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    evo_parser.add_argument("project", help="Project name (as stored in trajectory DB)")
+
     # dataflow command — single-project dataflow mural
     df_parser = sub.add_parser("dataflow", help="Generate single-project dataflow mural")
     df_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
@@ -313,6 +323,18 @@ def main() -> None:
                 max_concepts=args.max_concepts,
                 html=args.html,
             )
+            print(f"Output: {path}")
+
+        elif args.command == "wrapped":
+            from trajectory.output.project_wrapped import generate_project_wrapped
+
+            path = generate_project_wrapped(db, project_name=args.project)
+            print(f"Output: {path}")
+
+        elif args.command == "evolution":
+            from trajectory.output.concept_evolution import generate_concept_evolution
+
+            path = generate_concept_evolution(db, project_name=args.project)
             print(f"Output: {path}")
 
         elif args.command == "mural":
