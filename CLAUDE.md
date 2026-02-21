@@ -125,9 +125,9 @@ Multi-level extraction validated across 3 diverse project types:
 - Digest generation for daily/weekly summaries (deferred)
 
 **Phase 4 Visualization Spikes (next):**
+- Concept heatmap grid — DONE (`trajectory/output/concept_heatmap.py`). PoC on agent_ontology. Auto-granularity (day/week/month), per-level color ramps (blue=themes, purple=design_bets, green=techniques), p5/p95 outlier trimming for long spans, labeled legend. CLI: `python -m trajectory.cli heatmap <project> [--max-concepts 40]`
 - Code DNA strip (1 session spike)
 - Concept half-life chart (1 session spike)
-- Concept heatmap grid (1 session spike)
 - D3.js interactive force graph (2-3 session PoC)
 - See `docs/VISUALIZATION_EXPERIMENTS.md` for full backlog + dependency graph
 
@@ -142,7 +142,7 @@ trajectory/
 │   ├── models.py                  # All Pydantic models
 │   ├── db.py                      # TrajectoryDB class — SQLite wrapper with all operations
 │   ├── ingest.py                  # Orchestrator: runs extractors, dedup, stores events
-│   ├── cli.py                     # CLI: ingest, analyze, stats, query, extract-tech, extract-patterns, extract-deps, rollup, mural, dataflow
+│   ├── cli.py                     # CLI: ingest, analyze, stats, query, extract-tech, extract-patterns, extract-deps, rollup, heatmap, mural, dataflow
 │   ├── mcp_server.py              # MCP server — 8 tools
 │   ├── extractors/
 │   │   ├── base.py                # BaseExtractor ABC
@@ -160,6 +160,7 @@ trajectory/
 │   │   └── concept_linker.py      # Cross-project concept linking
 │   └── output/
 │       ├── query_engine.py        # NL query → SQL → LLM synthesis
+│       ├── concept_heatmap.py      # Concept heatmap grid (GitHub-squares style, auto-granularity)
 │       ├── mural.py               # AI art mural generator (themes × months + dataflow)
 │       └── wrapped.py             # Developer Wrapped card (treemap + heatmap)
 ├── data/
@@ -253,6 +254,10 @@ python -m trajectory.cli extract-tech /home/brian/projects/sam_gov
 python -m trajectory.cli extract-patterns          # all projects
 python -m trajectory.cli extract-deps              # cross-project deps
 python -m trajectory.cli rollup                    # concept activity + importance + lifecycle
+
+# Concept heatmap (GitHub-squares style)
+python -m trajectory.cli heatmap agent_ontology    # single project
+python -m trajectory.cli heatmap agent_ontology --max-concepts 60
 
 # Generate AI art mural (themes × months, PCA-positioned)
 python -m trajectory.cli mural --dry-run          # preview layout + prompts

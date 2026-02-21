@@ -107,6 +107,12 @@ def main() -> None:
     rollup_parser = sub.add_parser("rollup", help="Materialize concept activity + importance + lifecycle")
     rollup_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
 
+    # heatmap command
+    hm_parser = sub.add_parser("heatmap", help="Generate concept heatmap for a project")
+    hm_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    hm_parser.add_argument("project", help="Project name (as stored in trajectory DB)")
+    hm_parser.add_argument("--max-concepts", type=int, default=40, help="Max concept rows")
+
     # dataflow command — single-project dataflow mural
     df_parser = sub.add_parser("dataflow", help="Generate single-project dataflow mural")
     df_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
@@ -296,6 +302,16 @@ def main() -> None:
                 print("\nTop 15 concepts by importance:")
                 for c in top:
                     print(f"  {c['importance']:6.1f}  {c['lifecycle']:10s}  [{c['level'] or '?':12s}]  {c['name']}")
+
+        elif args.command == "heatmap":
+            from trajectory.output.concept_heatmap import generate_concept_heatmap
+
+            path = generate_concept_heatmap(
+                db,
+                project_name=args.project,
+                max_concepts=args.max_concepts,
+            )
+            print(f"Output: {path}")
 
         elif args.command == "mural":
             from trajectory.output.mural import generate_mural
