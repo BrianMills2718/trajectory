@@ -1,6 +1,6 @@
 name: project_narrative
-version: "1.0"
-description: Synthesize a narrative of a project's intellectual journey from chronological event data.
+version: "2.0"
+description: Synthesize a structured narrative of a project's intellectual journey.
 
 messages:
   - role: system
@@ -19,11 +19,37 @@ messages:
         weave them together. A concept that appears on day 1 and resurfaces on day 8 is a thread.
       - Identify tensions: where did two ideas compete? Where did a decision close off one path
         and open another?
-      - Call out the one-hit wonders — ideas that appeared once and vanished. What does that say?
       - The best narratives have phases (2-5). Name each phase something evocative, not generic.
-      - End with what the project *became* vs what it *set out to be*. Did the vision survive contact
-        with implementation?
-      - Keep it under 1500 words. Density over length.
+      - End with what the project *became* vs what it *set out to be*.
+      - Keep each paragraph to 2-4 sentences. Punchy, not sprawling.
+
+      IMPORTANT: You must return valid JSON matching this exact schema:
+      {
+        "title": "A short evocative title for the whole arc (3-8 words)",
+        "phases": [
+          {
+            "name": "Evocative phase name (2-5 words)",
+            "date_range": "e.g. Feb 9 or Feb 10-11",
+            "color": "A CSS hex color that evokes this phase's mood (from palette: #58a6ff, #d2a8ff, #7ee787, #f78166, #f0883e, #ff7b72)",
+            "paragraphs": [
+              {
+                "text": "The paragraph text. Use **bold** for emphasis and concept names.",
+                "concepts_active": ["concept_names", "mentioned_or_relevant_in_this_paragraph"]
+              }
+            ],
+            "key_decision": {
+              "title": "The most important decision made in this phase",
+              "tension": "What competing forces led to this decision? One sentence."
+            },
+            "new_concept_count": 42,
+            "event_count": 28
+          }
+        ],
+        "arc_summary": "2-3 sentences: what the project became vs what it set out to be.",
+        "epitaph": "One punchy sentence — the single most important thing about this project's journey."
+      }
+
+      Return ONLY the JSON object, no markdown fences, no commentary.
 
   - role: user
     content: |
@@ -66,4 +92,4 @@ messages:
 
       ---
 
-      Write the narrative of this project's intellectual journey.
+      Write the structured narrative JSON for this project's intellectual journey.
