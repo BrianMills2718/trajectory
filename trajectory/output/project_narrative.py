@@ -362,6 +362,87 @@ def record_video(
     return output_path
 
 
+def generate_supercut(
+    db: TrajectoryDB,
+    project_names: list[str],
+    model: str = "gemini/gemini-2.5-flash",
+    speed: float = 4.0,
+    width: int = 1920,
+    height: int = 1080,
+) -> Path:
+    """Generate narratives for multiple projects and stitch into one supercut video.
+
+    Each project gets its own narrative + video recording, then all are
+    concatenated with ffmpeg (with fade transitions) into a single MP4.
+    """
+    import shutil
+    import subprocess
+
+    output_dir = Path(__file__).parent.parent.parent / "data" / "narratives"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: Generate narratives and record videos for each project
+    video_paths: list[Path] = []
+    for name in project_names:
+        logger.info("=== Generating narrative for %s ===", name)
+        html_path = generate_narrative(db, project_name=name, model=model)
+        logger.info("=== Recording video for %s ===", name)
+        video_path = record_video(html_path, speed=speed, width=width, height=height)
+        video_paths.append(video_path)
+
+    if len(video_paths) < 2:
+        logger.info("Only one project — no supercut needed")
+        return video_paths[0]
+
+    # Step 2: Check for ffmpeg
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        # Try conda path
+        conda_ffmpeg = Path.home() / "miniconda3" / "bin" / "ffmpeg"
+        if conda_ffmpeg.exists():
+            ffmpeg = str(conda_ffmpeg)
+
+    if not ffmpeg:
+        logger.warning("ffmpeg not found — returning individual videos without stitching")
+        return video_paths[0]
+
+    # Step 3: Convert each WebM to MP4 for reliable concatenation
+    mp4_paths: list[Path] = []
+    for vp in video_paths:
+        mp4 = vp.with_suffix(".mp4")
+        logger.info("Converting %s → %s", vp.name, mp4.name)
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(vp), "-c:v", "libx264", "-preset", "fast",
+             "-crf", "23", "-pix_fmt", "yuv420p",
+             "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+             str(mp4)],
+            check=True, capture_output=True,
+        )
+        mp4_paths.append(mp4)
+
+    # Step 4: Build concat file for ffmpeg
+    concat_file = output_dir / ".concat_list.txt"
+    with open(concat_file, "w") as f:
+        for mp4 in mp4_paths:
+            f.write(f"file '{mp4}'\n")
+
+    # Step 5: Concatenate into supercut
+    supercut_path = output_dir / "supercut.mp4"
+    logger.info("Stitching %d videos into supercut...", len(mp4_paths))
+    subprocess.run(
+        [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
+         "-c", "copy", str(supercut_path)],
+        check=True, capture_output=True,
+    )
+
+    # Clean up
+    concat_file.unlink(missing_ok=True)
+
+    size_mb = supercut_path.stat().st_size / 1e6
+    logger.info("Supercut saved: %s (%.1f MB, %d projects)", supercut_path, size_mb, len(project_names))
+    return supercut_path
+
+
 def _esc(s: str) -> str:
     return (
         s.replace("&", "&amp;")

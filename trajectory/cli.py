@@ -141,6 +141,22 @@ def main() -> None:
         help="Playback speed for video recording (default: 2x)",
     )
 
+    # supercut command — multi-project video trailer
+    sc_parser = sub.add_parser("supercut", help="Generate multi-project narrative supercut video")
+    sc_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    sc_parser.add_argument(
+        "--projects", type=str, default=None,
+        help="Comma-separated project names (default: auto-select top 4 by concept count)",
+    )
+    sc_parser.add_argument(
+        "--model", type=str, default=None,
+        help="LLM model for synthesis (default: gemini-2.5-flash)",
+    )
+    sc_parser.add_argument(
+        "--speed", type=float, default=4.0,
+        help="Playback speed for video recording (default: 4x)",
+    )
+
     # dataflow command — single-project dataflow mural
     df_parser = sub.add_parser("dataflow", help="Generate single-project dataflow mural")
     df_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
@@ -368,6 +384,32 @@ def main() -> None:
 
                 video_path = record_video(path, speed=args.video_speed)
                 print(f"Video: {video_path}")
+
+        elif args.command == "supercut":
+            from trajectory.output.project_narrative import generate_supercut
+
+            if args.projects:
+                project_names = [p.strip() for p in args.projects.split(",")]
+            else:
+                # Auto-select top 4 by concept count
+                rows = db.conn.execute("""
+                    SELECT p.name, COUNT(DISTINCT ce.concept_id) as concepts
+                    FROM projects p
+                    JOIN events e ON e.project_id = p.id
+                    JOIN concept_events ce ON ce.event_id = e.id
+                    GROUP BY p.id
+                    HAVING concepts > 20
+                    ORDER BY concepts DESC
+                    LIMIT 4
+                """).fetchall()
+                project_names = [r["name"] for r in rows]
+                print(f"Auto-selected projects: {', '.join(project_names)}")
+
+            kwargs = {"speed": args.speed}
+            if args.model:
+                kwargs["model"] = args.model
+            path = generate_supercut(db, project_names, **kwargs)
+            print(f"Supercut: {path}")
 
         elif args.command == "mural":
             from trajectory.output.mural import generate_mural
