@@ -58,36 +58,35 @@ messages:
       Requirements:
       - Use `graph TD` (top-down directed graph)
       - Create a `subgraph` for each phase, labeled with the phase name
-      - Include only the 12-20 most important concepts as nodes. Use their exact concept names
-        (underscored, e.g. `evolutionary_search_pipeline`). These must match the concept names
-        from the data.
-      - Use `{"{Decision text}"}` diamond shapes for the 2-4 most pivotal decisions
+      - Include only the 12-20 most important concepts as nodes
+      - Node IDs MUST be alphanumeric + underscores ONLY (e.g. `evolutionary_search`)
+      - Node shapes: `nodeID["Label text"]` for concepts, `nodeID{{"Decision text"}}` for decisions
+      - EVERY node reference must use the bare ID (no shape syntax). Define the shape on first use only.
       - Edge labels should be verbs: `-->|evolves into|`, `-->|enables|`, `-->|replaces|`,
         `-->|feeds|`, `-.->|inspires|` (dotted for weaker links)
       - Cross-phase edges are encouraged — they show how ideas thread across time
-      - Style concept nodes by level:
-        - Themes: default rectangle
-        - Design bets: rounded rectangle `(concept_name)`
-        - Techniques: stadium shape `([concept_name])`
-      - Do NOT use special characters in node IDs — only letters, numbers, underscores
+      - Do NOT use parentheses `()` or `([])` for node shapes — they cause parse errors
       - Do NOT use quotes around node IDs
+      - Do NOT put shape syntax after `-->` arrows — only bare node IDs in edges
       - Keep it readable — prefer clarity over completeness
 
       Example fragment:
       ```
       graph TD
         subgraph Phase1["Foundations"]
-          yaml_spec_pipeline --> spec_driven_generation
-          yaml_spec_pipeline --> spec_instantiation_to_python
+          yaml_spec["YAML Spec Pipeline"]
+          spec_gen["Spec-Driven Generation"]
           D1{{"Pursue formal ontology"}}
-          yaml_spec_pipeline -.->|inspires| D1
+          yaml_spec --> spec_gen
+          yaml_spec -.->|inspires| D1
           D1 -->|enables| ontology_owl
         end
         subgraph Phase2["Evolution"]
-          spec_driven_generation -->|evolves into| evolutionary_search_pipeline
-          evolutionary_search_pipeline --> spec_mutation_engine
+          evo_search["Evolutionary Search"]
+          spec_gen -->|evolves into| evo_search
+          evo_search --> mutation_engine
         end
-        spec_mutation_engine -->|feeds| meta_evolution
+        mutation_engine -->|feeds| meta_evolution
       ```
 
       Return ONLY the JSON object, no markdown fences, no commentary.

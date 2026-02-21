@@ -246,6 +246,26 @@ def _inline_md(text: str) -> str:
     return text
 
 
+def _sanitize_mermaid(code: str) -> str:
+    """Fix common LLM mistakes in Mermaid flowchart syntax."""
+    lines = code.split("\n")
+    sanitized = []
+    for line in lines:
+        # Fix: `A --> (some_node)` or `A --> ([some_node])` — strip parens from edge targets
+        # These cause parse errors because Mermaid sees `(` as unexpected after `-->`
+        line = re.sub(
+            r"(-->|-.->)(\|[^|]*\|)?\s*\(\[?([a-zA-Z0-9_]+)\]?\)",
+            r"\1\2 \3",
+            line,
+        )
+        # Fix: node IDs with hyphens — replace with underscores
+        # (only in node positions, not inside labels/strings)
+        # Fix: bare `(node_name)` at start of line (shape def without ID prefix)
+        line = re.sub(r"^\s+\(([a-zA-Z0-9_]+)\)", r"  \1", line)
+        sanitized.append(line)
+    return "\n".join(sanitized)
+
+
 def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> str:
     """Render the full scrollytelling HTML page."""
 
@@ -308,8 +328,9 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
         f'<span class="ohw-tag">{_esc(c.replace("_", " "))}</span>' for c in ohw[:30]
     )
 
-    # Mermaid diagram from LLM
+    # Mermaid diagram from LLM — sanitize common mistakes
     mermaid_code = narrative.get("diagram", "graph TD\n  A[No diagram generated]")
+    mermaid_code = _sanitize_mermaid(mermaid_code)
     # Escape for embedding in HTML
     mermaid_json = json.dumps(mermaid_code)
 
