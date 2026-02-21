@@ -218,6 +218,36 @@ def generate_narrative(
         result.cost or 0,
     )
 
+    # --- Pass 2: Journey diagram derived from the narrative ---
+    logger.info("Generating journey diagram from narrative...")
+    diagram_messages = render_prompt(
+        PROMPTS_DIR / "narrative_diagram.yaml",
+        project_name=project_name,
+        phases=narrative.get("phases", []),
+        arc_summary=narrative.get("arc_summary", ""),
+        epitaph=narrative.get("epitaph", ""),
+        top_concepts=[c["name"] for c in data["top_concepts"][:20]],
+    )
+    diagram_result = call_llm(
+        model,
+        diagram_messages,
+        task="narrative_diagram",
+        trace_id=f"trajectory.narrative_diagram.{project_name}",
+        max_budget=0,
+    )
+    diagram_raw = diagram_result.content.strip()
+    if diagram_raw.startswith("```"):
+        diagram_raw = re.sub(r"^```(?:json)?\s*", "", diagram_raw)
+        diagram_raw = re.sub(r"\s*```$", "", diagram_raw)
+    graph_data = json.loads(diagram_raw)
+    narrative["graph"] = graph_data
+    logger.info(
+        "Diagram: %d nodes, %d edges, cost: $%.4f",
+        len(graph_data.get("nodes", [])),
+        len(graph_data.get("edges", [])),
+        diagram_result.cost or 0,
+    )
+
     html = _render_scrollytelling(project_name, data, narrative)
 
     output_dir = Path(__file__).parent.parent.parent / "data" / "narratives"
@@ -244,26 +274,6 @@ def _inline_md(text: str) -> str:
     text = re.sub(r"\*(.+?)\*", r"<em>\1</em>", text)
     text = re.sub(r"`(.+?)`", r"<code>\1</code>", text)
     return text
-
-
-def _sanitize_mermaid(code: str) -> str:
-    """Fix common LLM mistakes in Mermaid flowchart syntax."""
-    lines = code.split("\n")
-    sanitized = []
-    for line in lines:
-        # Fix: `A --> (some_node)` or `A --> ([some_node])` — strip parens from edge targets
-        # These cause parse errors because Mermaid sees `(` as unexpected after `-->`
-        line = re.sub(
-            r"(-->|-.->)(\|[^|]*\|)?\s*\(\[?([a-zA-Z0-9_]+)\]?\)",
-            r"\1\2 \3",
-            line,
-        )
-        # Fix: node IDs with hyphens — replace with underscores
-        # (only in node positions, not inside labels/strings)
-        # Fix: bare `(node_name)` at start of line (shape def without ID prefix)
-        line = re.sub(r"^\s+\(([a-zA-Z0-9_]+)\)", r"  \1", line)
-        sanitized.append(line)
-    return "\n".join(sanitized)
 
 
 def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> str:
@@ -309,7 +319,7 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
 
         phase_sections.append(f"""
         <section class="phase" data-phase="{i}" data-color="{color}">
-            <div class="phase-header reveal">
+            <div class="phase-header reveal" data-phase="{i}">
                 <div class="phase-number" style="color: {color}">Phase {i + 1}</div>
                 <h2 class="phase-title" style="--phase-color: {color}">{_esc(phase.get('name', ''))}</h2>
                 <div class="phase-date">{_esc(phase.get('date_range', ''))}</div>
@@ -328,14 +338,25 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
         f'<span class="ohw-tag">{_esc(c.replace("_", " "))}</span>' for c in ohw[:30]
     )
 
-    # Mermaid diagram from LLM — sanitize common mistakes
-    mermaid_code = narrative.get("diagram", "graph TD\n  A[No diagram generated]")
-    mermaid_code = _sanitize_mermaid(mermaid_code)
-    # Escape for embedding in HTML
-    mermaid_json = json.dumps(mermaid_code)
+    # Graph data from second LLM pass (D3 + dagre rendering)
+    graph_data = narrative.get("graph", {"nodes": [], "edges": []})
+    graph_json = json.dumps(graph_data)
 
-    # Phase names for highlighting
+    # Phase names for labels
     phase_names = [p.get("name", f"Phase {i+1}") for i, p in enumerate(narrative.get("phases", []))]
+
+    # Build timeline metadata for autoplay: [{phase, step, date_range, para_count}]
+    timeline_steps = []
+    for i, phase in enumerate(narrative.get("phases", [])):
+        n_paras = len(phase.get("paragraphs", []))
+        for j in range(n_paras):
+            timeline_steps.append({
+                "phase": i,
+                "step": j,
+                "date_range": phase.get("date_range", ""),
+                "phase_name": phase.get("name", f"Phase {i+1}"),
+            })
+    timeline_json = json.dumps(timeline_steps)
 
     stats = data
 
@@ -467,25 +488,108 @@ body {{
 }}
 .diagram-container {{
     width: 100%;
-    height: 100%;
+    height: calc(100% - 48px);
     overflow: auto;
+    position: relative;
+    cursor: grab;
+}}
+.diagram-container:active {{ cursor: grabbing; }}
+#diagram-svg {{
+    transform-origin: 0 0;
+    transition: transform 0.15s ease;
+    display: block;
+}}
+/* D3 graph node styles */
+.graph-node rect {{
+    fill: var(--bg-card);
+    stroke: var(--blue);
+    stroke-width: 1.5;
+}}
+.graph-node.type-decision polygon {{
+    fill: var(--bg-card);
+    stroke: var(--orange);
+    stroke-width: 2;
+}}
+.graph-node.type-dead rect {{
+    fill: var(--bg-card);
+    stroke: var(--red);
+    stroke-width: 1.5;
+    stroke-dasharray: 6 3;
+}}
+.graph-node.type-win rect {{
+    fill: var(--bg-card);
+    stroke: var(--green);
+    stroke-width: 3;
+    filter: drop-shadow(0 0 8px rgba(126, 231, 135, 0.4));
+}}
+.graph-node text {{
+    fill: var(--text);
+    font-size: 11px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}}
+.graph-node.type-decision text {{ fill: var(--orange); }}
+.graph-node.type-dead text {{ fill: var(--red); opacity: 0.8; }}
+.graph-node.type-win text {{ fill: var(--green); }}
+.graph-edge path {{
+    fill: none;
+    stroke: var(--text-dimmer);
+    stroke-width: 1.5;
+}}
+.graph-edge text {{
+    fill: var(--text-dim);
+    font-size: 9px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}}
+.phase-bg {{
+    fill: rgba(88, 166, 255, 0.03);
+    stroke: rgba(88, 166, 255, 0.08);
+    stroke-width: 1;
+    rx: 8;
+}}
+.phase-label-text {{
+    fill: var(--text-dimmer);
+    font-size: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}}
+/* Zoom controls */
+.zoom-controls {{
+    display: flex;
+    gap: 4px;
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border);
+    z-index: 10;
+}}
+.zoom-btn {{
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text-dim);
+    font-size: 16px;
+    cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 20px;
+    transition: background 0.15s;
 }}
-#mermaid-diagram {{
-    width: 100%;
+.zoom-btn:hover {{ background: var(--bg-card); color: var(--text-bright); }}
+.zoom-level {{
+    font-size: 11px;
+    color: var(--text-dimmer);
+    align-self: center;
+    margin-left: 8px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
 }}
-#mermaid-diagram svg {{
-    max-width: 100%;
-    height: auto;
-}}
-/* Mermaid progressive reveal */
-#mermaid-diagram .cluster,
-#mermaid-diagram .edgePath,
-#mermaid-diagram .edgeLabel {{
-    transition: opacity 0.6s ease, filter 0.6s ease;
+.phase-indicator {{
+    font-size: 11px;
+    color: var(--text-dim);
+    align-self: center;
+    margin-left: auto;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
 }}
 
 /* --- Phases --- */
@@ -680,10 +784,88 @@ body {{
 .ohw-tag:nth-child(odd) {{ animation-delay: 0.5s; }}
 .ohw-tag:nth-child(3n) {{ animation-delay: 1s; }}
 
+/* --- Cinema bar (autoplay) --- */
+.cinema-bar {{
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 48px;
+    background: rgba(13, 17, 23, 0.95);
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 16px;
+    z-index: 100;
+    backdrop-filter: blur(8px);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+}}
+.cinema-play {{
+    background: none;
+    border: 1px solid var(--blue);
+    color: var(--blue);
+    padding: 6px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s;
+}}
+.cinema-play:hover {{ background: rgba(88, 166, 255, 0.1); }}
+.cinema-play.playing {{
+    border-color: var(--orange);
+    color: var(--orange);
+}}
+.cinema-timeline {{
+    flex: 1;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    cursor: pointer;
+}}
+.cinema-progress {{
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--blue), var(--purple));
+    border-radius: 2px;
+    transition: width 0.3s ease;
+}}
+.cinema-date {{
+    color: var(--text-dim);
+    font-size: 12px;
+    min-width: 80px;
+    text-align: right;
+}}
+.cinema-time {{
+    color: var(--text-dimmer);
+    font-size: 11px;
+    min-width: 40px;
+}}
+
+/* Typewriter mode */
+.reveal.typewriter {{
+    opacity: 1 !important;
+    transform: none !important;
+}}
+.reveal.typewriter .typewriter-cursor {{
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    background: var(--blue);
+    margin-left: 2px;
+    animation: blink 0.6s step-end infinite;
+    vertical-align: text-bottom;
+}}
+@keyframes blink {{
+    50% {{ opacity: 0; }}
+}}
+
 /* --- Footer --- */
 .footer {{
     text-align: center;
-    padding: 40px 24px;
+    padding: 40px 24px 80px;
     color: var(--text-dimmer);
     font-size: 12px;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
@@ -741,8 +923,15 @@ body {{
         {''.join(phase_sections)}
     </div>
     <div class="graph-track">
+        <div class="zoom-controls">
+            <button class="zoom-btn" id="zoom-in" title="Zoom in">+</button>
+            <button class="zoom-btn" id="zoom-out" title="Zoom out">&minus;</button>
+            <button class="zoom-btn" id="zoom-reset" title="Reset zoom">&#x21bb;</button>
+            <span class="zoom-level" id="zoom-level">100%</span>
+            <span class="phase-indicator" id="phase-indicator"></span>
+        </div>
         <div class="diagram-container">
-            <div id="mermaid-diagram"></div>
+            <svg id="diagram-svg"></svg>
         </div>
     </div>
 </div>
@@ -760,60 +949,296 @@ body {{
     <div class="ohw-tags">{ohw_tags}</div>
 </div>
 
+<!-- Autoplay controls -->
+<div class="cinema-bar" id="cinema-bar">
+    <button class="cinema-play" id="cinema-play" title="Play cinematic mode">&#9654; Play</button>
+    <div class="cinema-timeline">
+        <div class="cinema-progress" id="cinema-progress"></div>
+    </div>
+    <span class="cinema-date" id="cinema-date">{_esc(stats['first_date'])}</span>
+    <span class="cinema-time" id="cinema-time"></span>
+</div>
+
 <div class="footer">Generated by trajectory &middot; {datetime.now().strftime('%b %d, %Y')}</div>
 
+<script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
 <script type="module">
-import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+import * as d3 from 'https://cdn.jsdelivr.net/npm/d3@7/+esm';
 
-const MERMAID_CODE = {mermaid_json};
+const GRAPH_DATA = {graph_json};
 const PHASE_NAMES = {json.dumps(phase_names)};
+const NODE_W = 170, NODE_H = 48, PAD = 40;
 
-// --- Mermaid init ---
-mermaid.initialize({{
-    startOnLoad: false,
-    theme: 'dark',
-    themeVariables: {{
-        primaryColor: '#1f2937',
-        primaryTextColor: '#e6edf3',
-        primaryBorderColor: '#58a6ff',
-        lineColor: '#8b949e',
-        secondaryColor: '#161b22',
-        tertiaryColor: '#0d1117',
-        background: '#0d1117',
-        mainBkg: '#161b22',
-        nodeBorder: '#58a6ff',
-        clusterBkg: 'rgba(88, 166, 255, 0.06)',
-        clusterBorder: 'rgba(88, 166, 255, 0.2)',
-        titleColor: '#e6edf3',
-        edgeLabelBackground: '#161b22',
-        fontSize: '13px',
-    }},
-    flowchart: {{
-        curve: 'basis',
-        padding: 16,
-        htmlLabels: true,
-        useMaxWidth: true,
-    }},
+// --- Build dagre layout ---
+const g = new dagre.graphlib.Graph({{ compound: true }});
+g.setGraph({{ rankdir: 'TB', ranksep: 70, nodesep: 35, marginx: PAD, marginy: PAD }});
+g.setDefaultEdgeLabel(() => ({{}}));
+
+PHASE_NAMES.forEach((name, i) => {{
+    g.setNode('_phase_' + i, {{ label: name, clusterLabelPos: 'top' }});
 }});
 
-async function renderDiagram() {{
-    const container = document.getElementById('mermaid-diagram');
-    try {{
-        const {{ svg }} = await mermaid.render('mermaid-svg', MERMAID_CODE);
-        container.innerHTML = svg;
+GRAPH_DATA.nodes.forEach(n => {{
+    const w = n.type === 'decision' ? NODE_W + 30 : NODE_W;
+    const h = n.type === 'decision' ? NODE_H + 16 : NODE_H;
+    g.setNode(n.id, {{ width: w, height: h, label: n.label }});
+    g.setParent(n.id, '_phase_' + n.phase);
+}});
 
-        // Tag subgraphs with phase indices for highlighting
-        const clusters = container.querySelectorAll('.cluster');
-        clusters.forEach((cluster, idx) => {{
-            cluster.setAttribute('data-phase', idx);
-        }});
-    }} catch (e) {{
-        console.error('Mermaid render error:', e);
-        container.innerHTML = '<pre style="color:#ff7b72;padding:20px;font-size:12px;">' +
-            'Diagram rendering failed.\\n' + e.message + '</pre>';
+GRAPH_DATA.edges.forEach(e => {{
+    g.setEdge(e.from, e.to, {{ label: e.label || '', style: e.style || 'solid' }});
+}});
+
+dagre.layout(g);
+
+// --- Render with D3 ---
+const graphW = g.graph().width || 600;
+const graphH = g.graph().height || 400;
+
+const svg = d3.select('#diagram-svg')
+    .attr('width', graphW)
+    .attr('height', graphH);
+
+// Arrowhead marker
+svg.append('defs').append('marker')
+    .attr('id', 'arrowhead')
+    .attr('viewBox', '0 0 10 10')
+    .attr('refX', 10).attr('refY', 5)
+    .attr('markerWidth', 7).attr('markerHeight', 7)
+    .attr('orient', 'auto')
+    .append('path').attr('d', 'M 0 0 L 10 5 L 0 10 z').attr('fill', '#8b949e');
+
+const root = svg.append('g');
+
+// Phase backgrounds
+PHASE_NAMES.forEach((name, i) => {{
+    const pn = g.node('_phase_' + i);
+    if (!pn) return;
+    root.append('rect')
+        .attr('class', 'phase-bg')
+        .attr('data-phase', i)
+        .attr('x', pn.x - pn.width / 2 - 12)
+        .attr('y', pn.y - pn.height / 2 - 24)
+        .attr('width', pn.width + 24)
+        .attr('height', pn.height + 36)
+        .attr('rx', 8)
+        .style('opacity', 0);
+    root.append('text')
+        .attr('class', 'phase-label-text')
+        .attr('data-phase', i)
+        .attr('x', pn.x - pn.width / 2 - 4)
+        .attr('y', pn.y - pn.height / 2 - 30)
+        .text(name)
+        .style('opacity', 0);
+}});
+
+// Edges
+const edgesG = root.append('g');
+const line = d3.line().x(p => p.x).y(p => p.y).curve(d3.curveBasis);
+
+GRAPH_DATA.edges.forEach(e => {{
+    const ed = g.edge(e.from, e.to);
+    if (!ed || !ed.points) return;
+
+    const eg = edgesG.append('g')
+        .attr('class', 'graph-edge')
+        .attr('data-from', e.from)
+        .attr('data-to', e.to)
+        .style('opacity', 0);
+
+    const path = eg.append('path')
+        .attr('d', line(ed.points))
+        .attr('marker-end', 'url(#arrowhead)');
+
+    if (e.style === 'dotted') path.attr('stroke-dasharray', '5 3');
+
+    if (e.label) {{
+        const mid = ed.points[Math.floor(ed.points.length / 2)];
+        eg.append('text')
+            .attr('x', mid.x)
+            .attr('y', mid.y - 8)
+            .attr('text-anchor', 'middle')
+            .text(e.label);
+    }}
+}});
+
+// Nodes
+const nodesG = root.append('g');
+
+function addLabel(group, label) {{
+    const words = label.split(/\\s+/);
+    const t = group.append('text').attr('text-anchor', 'middle');
+    if (words.length <= 4) {{
+        t.append('tspan').attr('x', 0).attr('dominant-baseline', 'central').text(label);
+    }} else {{
+        const mid = Math.ceil(words.length / 2);
+        t.append('tspan').attr('x', 0).attr('dy', '-0.4em').text(words.slice(0, mid).join(' '));
+        t.append('tspan').attr('x', 0).attr('dy', '1.2em').text(words.slice(mid).join(' '));
     }}
 }}
-renderDiagram();
+
+GRAPH_DATA.nodes.forEach(n => {{
+    const nd = g.node(n.id);
+    if (!nd) return;
+
+    const ng = nodesG.append('g')
+        .attr('class', 'graph-node type-' + n.type)
+        .attr('data-id', n.id)
+        .attr('data-phase', n.phase)
+        .attr('data-step', n.step)
+        .attr('transform', 'translate(' + nd.x + ',' + nd.y + ')')
+        .style('opacity', 0);
+
+    if (n.type === 'decision') {{
+        const hw = (NODE_W + 30) / 2, hh = (NODE_H + 16) / 2;
+        ng.append('polygon')
+            .attr('points', '0,' + (-hh) + ' ' + hw + ',0 0,' + hh + ' ' + (-hw) + ',0');
+    }} else {{
+        ng.append('rect')
+            .attr('x', -NODE_W / 2).attr('y', -NODE_H / 2)
+            .attr('width', NODE_W).attr('height', NODE_H)
+            .attr('rx', 6);
+    }}
+
+    addLabel(ng, n.label);
+}});
+
+// --- Scroll-triggered reveal ---
+const visibleNodes = new Set();
+const nodeById = {{}};
+GRAPH_DATA.nodes.forEach(n => {{ nodeById[n.id] = n; }});
+
+function revealUpTo(phase, step) {{
+    let stagger = 0;
+
+    // Reveal phase backgrounds
+    for (let p = 0; p <= phase; p++) {{
+        root.selectAll('.phase-bg[data-phase="' + p + '"], .phase-label-text[data-phase="' + p + '"]')
+            .transition().duration(400).style('opacity', p === phase ? 1 : 0.5);
+    }}
+
+    // Reveal nodes
+    GRAPH_DATA.nodes.forEach(n => {{
+        const shouldShow = n.phase < phase || (n.phase === phase && n.step <= step);
+        if (shouldShow && !visibleNodes.has(n.id)) {{
+            visibleNodes.add(n.id);
+            d3.select('.graph-node[data-id="' + n.id + '"]')
+                .transition()
+                .delay(stagger * 80)
+                .duration(400)
+                .ease(d3.easeBackOut.overshoot(1.1))
+                .style('opacity', 1);
+            stagger++;
+        }}
+    }});
+
+    // Reveal edges where both endpoints are visible
+    GRAPH_DATA.edges.forEach(e => {{
+        if (visibleNodes.has(e.from) && visibleNodes.has(e.to)) {{
+            const sel = edgesG.select('.graph-edge[data-from="' + e.from + '"][data-to="' + e.to + '"]');
+            if (sel.style('opacity') === '0') {{
+                // Animate the edge drawing itself
+                const path = sel.select('path');
+                const len = path.node() ? path.node().getTotalLength() : 0;
+                if (len > 0 && e.style !== 'dotted') {{
+                    path.attr('stroke-dasharray', len + ' ' + len)
+                        .attr('stroke-dashoffset', len);
+                    sel.style('opacity', 1);
+                    path.transition().duration(600).ease(d3.easeLinear)
+                        .attr('stroke-dashoffset', 0);
+                    sel.select('text').style('opacity', 0)
+                        .transition().delay(400).duration(300).style('opacity', 1);
+                }} else {{
+                    sel.transition().duration(500).style('opacity', 1);
+                }}
+            }}
+        }}
+    }});
+
+    // Auto-scroll diagram to latest revealed area (skip if user recently dragged)
+    if (!userPannedRecently) {{
+        const lastNode = [...visibleNodes].pop();
+        if (lastNode) {{
+            const nd = g.node(lastNode);
+            if (nd) {{
+                const container = document.querySelector('.diagram-container');
+                const targetY = Math.max(0, nd.y * zoomLevel - container.clientHeight / 2);
+                container.scrollTo({{ top: targetY, behavior: 'smooth' }});
+            }}
+        }}
+    }}
+
+    // Update phase indicator
+    const indicator = document.getElementById('phase-indicator');
+    if (indicator && PHASE_NAMES[phase]) {{
+        indicator.textContent = 'Phase ' + (phase + 1) + ': ' + PHASE_NAMES[phase];
+    }}
+}}
+
+// --- Zoom ---
+let zoomLevel = 1;
+const ZOOM_MIN = 0.5, ZOOM_MAX = 3, ZOOM_STEP = 0.25;
+
+function applyZoom() {{
+    const svgEl = document.getElementById('diagram-svg');
+    svgEl.style.transform = 'scale(' + zoomLevel + ')';
+    svgEl.style.transformOrigin = '0 0';
+    document.getElementById('zoom-level').textContent = Math.round(zoomLevel * 100) + '%';
+}}
+
+document.getElementById('zoom-in').addEventListener('click', () => {{
+    zoomLevel = Math.min(ZOOM_MAX, zoomLevel + ZOOM_STEP); applyZoom();
+}});
+document.getElementById('zoom-out').addEventListener('click', () => {{
+    zoomLevel = Math.max(ZOOM_MIN, zoomLevel - ZOOM_STEP); applyZoom();
+}});
+document.getElementById('zoom-reset').addEventListener('click', () => {{
+    zoomLevel = 1; applyZoom();
+    document.querySelector('.diagram-container').scrollTo({{ top: 0, left: 0 }});
+}});
+document.querySelector('.diagram-container').addEventListener('wheel', (e) => {{
+    if (e.ctrlKey || e.metaKey) {{
+        e.preventDefault();
+        zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel - e.deltaY * 0.002));
+        applyZoom();
+    }}
+}}, {{ passive: false }});
+
+// --- Drag to pan ---
+const dc = document.querySelector('.diagram-container');
+let isDragging = false, dragStartX = 0, dragStartY = 0, scrollStartX = 0, scrollStartY = 0;
+let userPannedRecently = false, panTimer = null;
+
+dc.addEventListener('mousedown', (e) => {{
+    // Only start drag on left button, not on zoom controls
+    if (e.button !== 0 || e.target.closest('.zoom-controls')) return;
+    isDragging = true;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    scrollStartX = dc.scrollLeft;
+    scrollStartY = dc.scrollTop;
+    dc.style.cursor = 'grabbing';
+    e.preventDefault();
+}});
+
+window.addEventListener('mousemove', (e) => {{
+    if (!isDragging) return;
+    dc.scrollLeft = scrollStartX - (e.clientX - dragStartX);
+    dc.scrollTop = scrollStartY - (e.clientY - dragStartY);
+}});
+
+window.addEventListener('mouseup', () => {{
+    if (isDragging) {{
+        isDragging = false;
+        dc.style.cursor = 'grab';
+        userPannedRecently = true;
+        clearTimeout(panTimer);
+        panTimer = setTimeout(() => {{ userPannedRecently = false; }}, 5000);
+    }}
+}});
+
+// Prevent SVG native drag behavior
+dc.addEventListener('dragstart', (e) => e.preventDefault());
 
 // --- Counter animation ---
 document.querySelectorAll('.hero-stat .num').forEach(el => {{
@@ -830,7 +1255,7 @@ document.querySelectorAll('.hero-stat .num').forEach(el => {{
     setTimeout(() => requestAnimationFrame(tick), 1200);
 }});
 
-// --- Reveal on scroll ---
+// --- Reveal on scroll (narrative paragraphs) ---
 const observer = new IntersectionObserver((entries) => {{
     entries.forEach(e => {{
         if (e.isIntersecting) {{
@@ -841,132 +1266,192 @@ const observer = new IntersectionObserver((entries) => {{
                     setTimeout(() => chip.classList.remove('glow'), 1200);
                 }}, i * 150);
             }});
+            // Trigger graph reveal for this paragraph
+            const phase = parseInt(e.target.dataset.phase);
+            const step = parseInt(e.target.dataset.para);
+            if (!isNaN(phase) && !isNaN(step)) {{
+                revealUpTo(phase, step);
+            }}
         }}
     }});
 }}, {{ threshold: 0.15, rootMargin: '0px 0px -60px 0px' }});
 
 document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
 
-// --- Progressive diagram reveal ---
-let maxRevealedPhase = -1;
-
-// Build node→cluster mapping after render
-function buildClusterMap() {{
-    const diagram = document.getElementById('mermaid-diagram');
-    const clusters = diagram.querySelectorAll('.cluster');
-    const nodeToPhase = {{}};
-
-    clusters.forEach((cluster, idx) => {{
-        // Hide all clusters initially
-        cluster.style.opacity = '0';
-        cluster.setAttribute('data-phase', idx);
-
-        // Map node IDs within this cluster to its phase index
-        cluster.querySelectorAll('.node').forEach(node => {{
-            if (node.id) nodeToPhase[node.id] = idx;
-        }});
-    }});
-
-    // Hide all edges and edge labels initially
-    diagram.querySelectorAll('.edgePath, .edgeLabel').forEach(el => {{
-        el.style.opacity = '0';
-    }});
-
-    return {{ clusters, nodeToPhase }};
-}}
-
-// Determine which phase an edge belongs to (max phase of its endpoints)
-function getEdgePhase(edgeEl, nodeToPhase) {{
-    const id = edgeEl.id || '';
-    let maxPhase = -1;
-    for (const [nodeId, phase] of Object.entries(nodeToPhase)) {{
-        if (id.includes(nodeId)) {{
-            maxPhase = Math.max(maxPhase, phase);
-        }}
-    }}
-    return maxPhase;
-}}
-
-let clusterMap = null;
-
-// Wait for mermaid to finish rendering, then build map
-const waitForRender = setInterval(() => {{
-    const svg = document.querySelector('#mermaid-diagram svg');
-    if (svg) {{
-        clearInterval(waitForRender);
-        clusterMap = buildClusterMap();
-    }}
-}}, 200);
-
-function revealUpToPhase(phaseIdx) {{
-    if (!clusterMap) return;
-    const {{ clusters, nodeToPhase }} = clusterMap;
-    const diagram = document.getElementById('mermaid-diagram');
-
-    clusters.forEach((cluster, idx) => {{
-        if (idx <= phaseIdx) {{
-            // Current phase: full opacity. Previous phases: dimmed.
-            cluster.style.opacity = (idx === phaseIdx) ? '1' : '0.35';
-            cluster.style.filter = (idx === phaseIdx) ? 'none' : 'saturate(0.4)';
-        }} else {{
-            // Future phases: hidden
-            cluster.style.opacity = '0';
-            cluster.style.filter = 'none';
-        }}
-    }});
-
-    // Reveal edges whose endpoints are both visible (phase <= phaseIdx)
-    diagram.querySelectorAll('.edgePath').forEach(edge => {{
-        const edgePhase = getEdgePhase(edge, nodeToPhase);
-        if (edgePhase >= 0 && edgePhase <= phaseIdx) {{
-            edge.style.opacity = (edgePhase === phaseIdx) ? '1' : '0.35';
-        }} else {{
-            edge.style.opacity = '0';
-        }}
-    }});
-    diagram.querySelectorAll('.edgeLabel').forEach(label => {{
-        // Edge labels follow same pattern — match by sibling index
-        const id = label.id || '';
-        let labelPhase = -1;
-        for (const [nodeId, phase] of Object.entries(nodeToPhase)) {{
-            if (id.includes(nodeId)) {{
-                labelPhase = Math.max(labelPhase, phase);
-            }}
-        }}
-        if (labelPhase >= 0 && labelPhase <= phaseIdx) {{
-            label.style.opacity = (labelPhase === phaseIdx) ? '1' : '0.3';
-        }} else {{
-            label.style.opacity = '0';
-        }}
-    }});
-
-    // Scroll diagram to keep active cluster in view
-    if (phaseIdx >= 0 && phaseIdx < clusters.length) {{
-        const rect = clusters[phaseIdx].querySelector('rect');
-        if (rect) {{
-            const y = parseFloat(rect.getAttribute('y') || 0);
-            const container = diagram.parentElement;
-            container.scrollTo({{
-                top: Math.max(0, y - container.clientHeight / 3),
-                behavior: 'smooth'
-            }});
-        }}
-    }}
-}}
-
+// Also trigger on phase headers
 const phaseObserver = new IntersectionObserver((entries) => {{
     entries.forEach(entry => {{
         if (entry.isIntersecting) {{
             const phase = parseInt(entry.target.dataset.phase);
-            if (phase > maxRevealedPhase) {{
-                maxRevealedPhase = phase;
-            }}
-            revealUpToPhase(phase);
+            revealUpTo(phase, 0);
         }}
     }});
 }}, {{ threshold: 0.3 }});
 
-document.querySelectorAll('.phase').forEach(el => phaseObserver.observe(el));
+document.querySelectorAll('.phase-header').forEach(el => phaseObserver.observe(el));
+
+// === CINEMA MODE (autoplay) ===
+const TIMELINE = {timeline_json};
+const STEP_DURATION = 4000; // ms per paragraph
+const TYPEWRITER_SPEED = 20; // ms per character
+
+let cinemaPlaying = false;
+let cinemaStep = -1; // -1 = hero, 0..N = paragraphs
+let cinemaTimer = null;
+let typewriterTimer = null;
+
+const playBtn = document.getElementById('cinema-play');
+const progressBar = document.getElementById('cinema-progress');
+const dateDisplay = document.getElementById('cinema-date');
+const timeDisplay = document.getElementById('cinema-time');
+
+playBtn.addEventListener('click', () => {{
+    if (cinemaPlaying) {{
+        stopCinema();
+    }} else {{
+        startCinema();
+    }}
+}});
+
+function startCinema() {{
+    cinemaPlaying = true;
+    playBtn.textContent = '\\u275A\\u275A Pause';
+    playBtn.classList.add('playing');
+    userPannedRecently = false;
+
+    // If at the end, restart
+    if (cinemaStep >= TIMELINE.length - 1) cinemaStep = -1;
+
+    advanceCinema();
+}}
+
+function stopCinema() {{
+    cinemaPlaying = false;
+    playBtn.textContent = '\\u25B6 Play';
+    playBtn.classList.remove('playing');
+    clearTimeout(cinemaTimer);
+    clearTimeout(typewriterTimer);
+}}
+
+function advanceCinema() {{
+    if (!cinemaPlaying) return;
+    cinemaStep++;
+
+    if (cinemaStep === 0) {{
+        // Scroll past hero
+        window.scrollTo({{ top: window.innerHeight - 100, behavior: 'smooth' }});
+        cinemaTimer = setTimeout(advanceCinema, 1500);
+        return;
+    }}
+
+    const idx = cinemaStep - 1;
+    if (idx >= TIMELINE.length) {{
+        // Done — scroll to epitaph
+        const arc = document.querySelector('.arc-section');
+        if (arc) arc.scrollIntoView({{ behavior: 'smooth' }});
+        progressBar.style.width = '100%';
+        stopCinema();
+        return;
+    }}
+
+    const step = TIMELINE[idx];
+    const progress = ((idx + 1) / TIMELINE.length) * 100;
+    progressBar.style.width = progress + '%';
+    dateDisplay.textContent = step.date_range;
+
+    // Find the paragraph element
+    const paraEl = document.querySelector(
+        '.reveal[data-phase="' + step.phase + '"][data-para="' + step.step + '"]'
+    );
+    // Also reveal the phase header if this is step 0
+    if (step.step === 0) {{
+        const header = document.querySelector('.phase-header[data-phase="' + step.phase + '"]');
+        if (header) {{
+            header.classList.add('visible');
+            header.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+        }}
+        // Brief pause for header
+        cinemaTimer = setTimeout(() => {{
+            if (!cinemaPlaying) return;
+            typewriteParagraph(paraEl, step, idx);
+        }}, 800);
+        return;
+    }}
+
+    typewriteParagraph(paraEl, step, idx);
+}}
+
+function typewriteParagraph(paraEl, step, idx) {{
+    if (!paraEl || !cinemaPlaying) return;
+
+    // Scroll paragraph into view
+    paraEl.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+
+    // Trigger graph reveal
+    revealUpTo(step.phase, step.step);
+
+    // Typewriter effect: store original HTML, type it out
+    const fullHTML = paraEl.innerHTML;
+    const fullText = paraEl.textContent;
+    paraEl.classList.add('visible', 'typewriter');
+    paraEl.innerHTML = '<span class="typewriter-cursor"></span>';
+
+    let charIdx = 0;
+    // We type the text content but restore full HTML at the end (for concept chips etc.)
+    function typeChar() {{
+        if (!cinemaPlaying) {{
+            paraEl.innerHTML = fullHTML;
+            return;
+        }}
+        charIdx++;
+        if (charIdx <= fullText.length) {{
+            paraEl.innerHTML = fullText.slice(0, charIdx) + '<span class="typewriter-cursor"></span>';
+            typewriterTimer = setTimeout(typeChar, TYPEWRITER_SPEED);
+        }} else {{
+            // Done typing — restore full HTML with concept chips
+            paraEl.innerHTML = fullHTML;
+            paraEl.querySelectorAll('.concept-chip').forEach((chip, i) => {{
+                setTimeout(() => {{
+                    chip.classList.add('glow');
+                    setTimeout(() => chip.classList.remove('glow'), 1200);
+                }}, i * 150);
+            }});
+            // Pause, then advance
+            cinemaTimer = setTimeout(advanceCinema, 1200);
+        }}
+    }}
+    // Start typing after scroll settles
+    setTimeout(typeChar, 400);
+}}
+
+// Timeline bar click to seek
+document.querySelector('.cinema-timeline').addEventListener('click', (e) => {{
+    const rect = e.currentTarget.getBoundingClientRect();
+    const pct = (e.clientX - rect.left) / rect.width;
+    const targetIdx = Math.floor(pct * TIMELINE.length);
+    cinemaStep = targetIdx; // advanceCinema will increment
+    if (!cinemaPlaying) startCinema();
+    else advanceCinema();
+}});
+
+// Show elapsed time during playback
+let cinemaStartTime = null;
+setInterval(() => {{
+    if (cinemaPlaying) {{
+        if (!cinemaStartTime) cinemaStartTime = Date.now();
+        const elapsed = Math.floor((Date.now() - cinemaStartTime) / 1000);
+        const m = Math.floor(elapsed / 60);
+        const s = elapsed % 60;
+        timeDisplay.textContent = m + ':' + String(s).padStart(2, '0');
+    }} else {{
+        cinemaStartTime = null;
+    }}
+}}, 1000);
+
+// Auto-start if URL has ?autoplay
+if (new URLSearchParams(window.location.search).has('autoplay')) {{
+    setTimeout(startCinema, 2000);
+}}
 </script>
 </body>
 </html>"""
