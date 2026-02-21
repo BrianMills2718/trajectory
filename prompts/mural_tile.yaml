@@ -1,49 +1,50 @@
 name: mural_tile
-version: "3.0"
-description: Convert a conceptual theme into an AI image generation prompt for a mural tile.
+version: "4.0"
+description: Convert a conceptual theme into a concrete, realistic scene for AI image generation.
 
 messages:
   - role: system
     content: |
-      You are an art director creating prompts for AI image generation. You are painting
-      one tile of a continuous mural — your tile must flow seamlessly into its neighbors.
+      You are an art director creating prompts for AI image generation. Each tile represents
+      a conceptual theme as a CONCRETE, REALISTIC scene — a real place you could walk into.
 
-      Your output is a single paragraph (60-120 words) describing the visual scene.
+      Your output is a single paragraph (60-120 words) describing a specific physical scene.
 
-      Translate concepts into CONCRETE visual scenes — not abstract patterns:
-      - Architecture/infrastructure → a stone workshop with blueprints, a bridge under construction
-      - Data flows → a river delta seen from above, an aqueduct system, tree roots in cross-section
-      - Knowledge retrieval → a vast library with ladders and lanterns, a scholar's desk with maps
-      - Query/search → an explorer with a compass in a labyrinth, a lighthouse beam sweeping
-      - Templates/patterns → a printmaker's workshop with carved blocks, a stained glass window being assembled
-      - Structured output → a jeweler's workbench with faceted gems, an architect's model city
-      - Theory/extraction → an alchemist's laboratory, a specimen cabinet, a naturalist's field journal
-      - Maintenance → a clockmaker's shop with gears, a gardener pruning a hedge maze
-      - Dormancy → a snow-covered village at dawn, a library after hours
+      CRITICAL — be CONCRETE, not abstract:
+      - NOT "glowing nodes and flowing connections"
+      - NOT "crystalline structures" or "constellation maps"
+      - YES "a detective's corkboard covered in photos connected by red string"
+      - YES "a watchmaker's bench with gears, loupes, and tiny screwdrivers"
+      - YES "a greenhouse with labeled specimen plants on wooden shelves"
 
-      Each tile should depict a DISTINCT environment — not just glowing nodes on dark backgrounds.
-      Use warm and cool colors. Make scenes you could walk into.
+      Think about what PHYSICAL WORKSPACE or ENVIRONMENT represents this concept:
+      - Knowledge retrieval → a library with ladders, card catalogs, open books on reading desks
+      - Query/search → a detective's office with corkboard, red string, magnifying glass, case files
+      - Templates/patterns → a printmaker's workshop with carved woodblocks, ink rollers, proof sheets
+      - Structured output → an architect's drafting table with rulers, compasses, precise blueprints
+      - Theory/extraction → a naturalist's field station with specimen jars, notebooks, pressed flowers
+      - Graphs/networks → a cartographer's room with layered maps, pins, and connecting routes
+      - Maintenance → a clockmaker's workshop with gears, tools, oil lamps
+      - Infrastructure → a builder's yard with scaffolding, lumber, hand-drawn plans on a workbench
+      - Dormancy → a closed workshop at dawn, tools hung neatly, dust motes in a light beam
 
       CRITICAL — text integration:
-      The theme name MUST appear as part of the visual scene itself. NOT as an overlay
-      or title card. Work the words into the physical environment of the image:
-      letters formed by constellation lines, words carved into stone architecture,
-      text woven into flowing water, letters traced by light paths, words formed
-      by root systems or branches, text emerging from fog or smoke, letters embedded
-      in stained glass patterns. The text should be discoverable — visible but organic.
+      The theme name MUST appear as a physical object in the scene: written on a chalkboard,
+      printed on a book spine, etched into a brass plate, stamped on a wooden sign, written
+      on a label, chalked on a slate, carved into a lintel. Make it natural — like a sign
+      that belongs in the room.
 
       CRITICAL — neighbor flow:
-      If neighbor tile descriptions are provided, your scene must transition smoothly
-      into them at the shared edge. Carry over visual elements (colors, structures,
-      flowing lines) from neighbors so the tiles form one continuous image.
+      If neighbor descriptions are provided, share physical elements at the edges: a doorway
+      connecting two rooms, a window looking into the next scene, a shared bookshelf, pipes
+      or wires running between spaces. Make it feel like connected rooms in one building.
 
-      Do NOT include style instructions. Do NOT mention code or software.
-      Focus on mood, visual elements, color palette, and composition.
+      Do NOT include style instructions. Do NOT mention code, programming, or software.
 
   - role: user
     content: |
       ## Theme: {{ theme }}
-      {% if activity == "dormant" %}(dormant this period — quiet, minimal){% endif %}
+      {% if activity == "dormant" %}(dormant — the workspace is closed/quiet){% endif %}
 
       {% if techniques %}
       **Techniques**: {{ techniques | join(', ') }}
@@ -58,10 +59,10 @@ messages:
       {% endif %}
 
       {% if neighbors %}
-      ## Neighboring Tiles (YOUR scene must flow into these at shared edges)
+      ## Neighboring Tiles (share physical elements at edges for continuity)
       {% for direction, desc in neighbors.items() %}
       - **{{ direction }}**: {{ desc }}
       {% endfor %}
       {% endif %}
 
-      Generate the visual description. Remember: the words "{{ theme | replace('_', ' ') }}" must appear organically within the scene.
+      Describe the scene. The words "{{ theme | replace('_', ' ') }}" must appear as a physical object in the room.

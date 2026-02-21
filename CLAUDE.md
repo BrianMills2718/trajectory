@@ -93,14 +93,15 @@ Multi-level extraction validated across 3 diverse project types:
 - Validation: rejects unknown concept names, self-links, invalid relationship types
 
 **Phase 4: Mural Visualization** — IN PROGRESS
-- `trajectory/output/mural.py` — AI art mural generator. Tiles = themes (not projects). X-axis = time (months), Y-axis = conceptual space via PCA on sub-concepts (techniques + design_bets) with TF-IDF weighting. Alpha-blended edges for seamless compositing.
-- `prompts/mural_tile.yaml` — Jinja2 template converting theme data into art prompts. Metaphorical imagery, no project names or code references.
-- `MuralConfig` in config.py — tile_size, vertical_overlap, style_suffix, prompt_model, image_model, max_cost
-- Image generation via OpenAI `gpt-image-1` (direct, not proxied through OpenRouter)
+- `trajectory/output/mural.py` — AI art mural generator (v2). LLM-planned vertical layout (themes arranged by conceptual relationships), corner-out scanline generation (each tile prompt references already-generated neighbors for coherence). Alpha-blended edges for compositing.
+- `prompts/mural_tile.yaml` — v4.0 Jinja2 template. Concrete/literal style — physical workspaces, not abstract imagery. Theme name appears as physical object in scene.
+- `prompts/mural_layout.yaml` — LLM arranges themes into vertical order based on concept links and co-occurrence.
+- `MuralConfig` in config.py — tile_size, vertical_overlap, style_suffix, prompt_model, image_model, max_cost, max_projects, max_months
+- Image generation via Gemini `gemini-2.5-flash-image` (free tier, google-genai SDK)
 - Prompt generation via `gemini/gemini-2.5-flash-lite` through `llm_client`
+- Seam blending: Stability AI inpainting tested for seamless tile transitions ($0.01/credit)
 - CLI: `python -m trajectory.cli mural [--themes ...] [--months ...] [--dry-run]`
-- Proof of concept: 3-tile mural (graph_rag, prompt_templates, theory_extraction) with working alpha blending
-- Dependencies: Pillow, numpy, openai
+- Dependencies: Pillow, google-genai
 
 ### What's NOT Built Yet
 
@@ -108,8 +109,9 @@ Multi-level extraction validated across 3 diverse project types:
 - Digest generation for daily/weekly summaries (deferred)
 
 **Phase 4 Remaining:**
-- Configurable timescale (weeks/quarters, not just months)
-- 2D conceptual mural (no time axis — both axes from PCA/UMAP)
+- Single-project dependency-graph mural (LLM generates layout from concept hierarchy, no time axis)
+- Stability AI seam blending integrated into pipeline (currently ad-hoc tested)
+- Literal software-process visuals (show actual YAML, JSON schemas, data flow — not metaphorical rooms)
 - `trajectory/output/html_timeline.py` — D3.js interactive timeline
 - `trajectory/output/markdown_exporter.py` — Narrative markdown reports
 
@@ -248,7 +250,7 @@ python -m pytest tests/ -v
 pip install pydriller pydantic pyyaml python-dotenv litellm instructor jinja2
 pip install -e ~/projects/llm_client
 pip install "mcp>=1.0"
-pip install Pillow numpy openai  # for mural generation
+pip install Pillow google-genai  # for mural generation
 ```
 
 ## Full Plan

@@ -38,8 +38,8 @@ class MuralConfig(BaseModel):
     vertical_overlap: float = 0.35  # fraction of tile_size overlapping between adjacent rows
     quality: str = "medium"
     style_suffix: str = (
-        "detailed illustration in the style of a fantasy world-building concept art, "
-        "rich colors, warm lighting, painterly brushwork, each scene distinct but connected"
+        "realistic detailed illustration, warm lamp lighting, rich textures, "
+        "like a graphic novel panel or studio ghibli background painting"
     )
     prompt_model: str = "gemini/gemini-2.5-flash-lite"
     image_model: str = "gemini-2.5-flash-image"
