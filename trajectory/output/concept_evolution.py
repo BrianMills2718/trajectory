@@ -477,6 +477,66 @@ body {{
 svg .glow {{
     filter: url(#glow);
 }}
+/* Edge pulse animation */
+@keyframes edgePulse {{
+    0% {{ stroke-opacity: 0.9; stroke-width: 4; }}
+    100% {{ stroke-opacity: 0; stroke-width: 8; }}
+}}
+.edge-pulse {{
+    animation: edgePulse 0.8s ease-out forwards;
+    pointer-events: none;
+}}
+/* Node entrance pop */
+@keyframes nodePop {{
+    0% {{ r: 0; opacity: 0; }}
+    50% {{ opacity: 1; }}
+    100% {{ opacity: 1; }}
+}}
+/* Finale overlay */
+#finale {{
+    position: absolute;
+    inset: 0;
+    background: rgba(13,17,23,0.85);
+    display: none;
+    z-index: 25;
+    justify-content: center;
+    align-items: center;
+    flex-direction: column;
+    text-align: center;
+    gap: 16px;
+}}
+#finale.visible {{ display: flex; }}
+#finale .f-title {{
+    font-size: 42px;
+    font-weight: 800;
+    background: linear-gradient(135deg, #58a6ff, #d2a8ff, #7ee787);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}}
+#finale .f-stats {{
+    display: flex;
+    gap: 32px;
+    justify-content: center;
+}}
+#finale .f-stat {{
+    text-align: center;
+}}
+#finale .f-num {{
+    font-size: 36px;
+    font-weight: 800;
+}}
+#finale .f-label {{
+    font-size: 11px;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}}
+#finale .f-anchors {{
+    color: #8b949e;
+    font-size: 14px;
+    margin-top: 8px;
+}}
 </style>
 </head>
 <body>
@@ -498,6 +558,15 @@ svg .glow {{
         <div class="n-text"></div>
     </div>
     <div id="beatIndicator"></div>
+    <div id="finale">
+        <div class="f-title">{project_name}</div>
+        <div class="f-stats">
+            <div class="f-stat"><div class="f-num" id="fConcepts">0</div><div class="f-label">concepts</div></div>
+            <div class="f-stat"><div class="f-num" id="fConnections">0</div><div class="f-label">connections</div></div>
+            <div class="f-stat"><div class="f-num" id="fBeats">0</div><div class="f-label">beats</div></div>
+        </div>
+        <div class="f-anchors" id="fAnchors"></div>
+    </div>
 </div>
 
 <div class="controls">
@@ -582,20 +651,62 @@ slider.addEventListener("input", () => {{
     jumpTo(target);
 }});
 
-function R(d) {{ return Math.min(5 + Math.pow(d.count, 0.6) * 4, 32); }}
+function R(d) {{
+    const base = Math.min(5 + Math.pow(d.count, 0.6) * 4, 32);
+    // Dormant nodes shrink
+    if (currentBeat >= 0) {{
+        const age = currentBeat - d.lastSeen;
+        if (age > 6) return Math.max(base * 0.3, 3);
+        if (age > 3) return base * 0.6;
+    }}
+    return base;
+}}
 
 function opacity(d) {{
     if (currentBeat < 0) return 0.3;
     const age = currentBeat - d.lastSeen;
     if (age <= 0) return 1.0;
-    if (age <= 2) return 0.7;
-    if (age <= 5) return 0.4;
-    return 0.2;
+    if (age <= 1) return 0.85;
+    if (age <= 3) return 0.45;
+    if (age <= 6) return 0.2;
+    return 0.08; // nearly invisible
+}}
+
+// Camera: smoothly pan/zoom to center on active nodes
+let userHasPanned = false;
+svg.on("mousedown.userpan", () => {{ userHasPanned = true; }});
+
+function autoCam(activeNames) {{
+    if (userHasPanned || activeNames.size === 0) return;
+    const activeNodes = Array.from(nodes.values()).filter(n => activeNames.has(n.name));
+    if (activeNodes.length === 0) return;
+
+    let cx = 0, cy = 0;
+    for (const n of activeNodes) {{ cx += n.x; cy += n.y; }}
+    cx /= activeNodes.length;
+    cy /= activeNodes.length;
+
+    // Compute bounding box of active nodes
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const n of activeNodes) {{
+        minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+        minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+    }}
+    const spread = Math.max(maxX - minX, maxY - minY, 100);
+    const scale = Math.min(W / (spread + 200), H / (spread + 200), 2.5);
+
+    const tx = W / 2 - cx * scale;
+    const ty = H / 2 - cy * scale;
+    const transform = d3.zoomIdentity.translate(tx, ty).scale(scale);
+
+    svg.transition().duration(800).ease(d3.easeCubicOut)
+        .call(d3.zoom().scaleExtent([0.2, 6]).on("zoom", e => g.attr("transform", e.transform)).transform, transform);
 }}
 
 function applyBeat(idx) {{
     const beat = beats[idx];
     const justActivated = new Set();
+    const newEdgeKeys = [];
     for (const name of beat.concepts) {{
         if (nodes.has(name)) {{
             const n = nodes.get(name);
@@ -619,9 +730,10 @@ function applyBeat(idx) {{
             edges.get(key).weight++;
         }} else {{
             edges.set(key, {{ source: a, target: b, weight: 1 }});
+            newEdgeKeys.push(key);
         }}
     }}
-    return justActivated;
+    return {{ justActivated, newEdgeKeys }};
 }}
 
 function jumpTo(target) {{
@@ -632,6 +744,10 @@ function jumpTo(target) {{
     currentBeat = target;
     updateUI(new Set());
     render();
+    // Reset camera on jump
+    userHasPanned = false;
+    const allActive = new Set(beats[target] ? beats[target].concepts : []);
+    autoCam(allActive);
 }}
 
 function updateUI(justActivated) {{
@@ -800,9 +916,55 @@ function scheduleNext() {{
 function stepForward() {{
     if (currentBeat >= beats.length - 1) return;
     currentBeat++;
-    const activated = applyBeat(currentBeat);
-    updateUI(activated);
+    const {{ justActivated, newEdgeKeys }} = applyBeat(currentBeat);
+    updateUI(justActivated);
     render();
+
+    // Camera follows the action
+    autoCam(justActivated);
+
+    // Pulse new edges
+    if (newEdgeKeys.length > 0 && newEdgeKeys.length < 30) {{
+        pulseEdges(newEdgeKeys);
+    }}
+
+    // Finale
+    const moment = moments.find(m => m.beat === currentBeat);
+    if (moment && moment.type === "finale") {{
+        setTimeout(showFinale, 1500);
+    }}
+}}
+
+function pulseEdges(edgeKeys) {{
+    // Add temporary bright lines that animate and disappear
+    const pulseGroup = g.append("g").attr("class", "pulse-group");
+    for (const key of edgeKeys) {{
+        const edge = edges.get(key);
+        if (!edge) continue;
+        const s = typeof edge.source === "string" ? nodes.get(edge.source) : edge.source;
+        const t = typeof edge.target === "string" ? nodes.get(edge.target) : edge.target;
+        if (!s || !t) continue;
+        const level = conceptLevels[s.name || s] || "technique";
+        pulseGroup.append("line")
+            .attr("x1", s.x).attr("y1", s.y)
+            .attr("x2", t.x).attr("y2", t.y)
+            .attr("stroke", COLORS[level] || COLORS.technique)
+            .attr("class", "edge-pulse");
+    }}
+    setTimeout(() => pulseGroup.remove(), 900);
+}}
+
+function showFinale() {{
+    document.getElementById("fConcepts").textContent = nodes.size;
+    document.getElementById("fConnections").textContent = edges.size;
+    document.getElementById("fBeats").textContent = beats.length;
+    // Top 3 concepts
+    const sorted = Array.from(nodes.values()).sort((a, b) => b.count - a.count);
+    const top3 = sorted.slice(0, 3).map(n => n.name.replace(/_/g, " ")).join(" · ");
+    document.getElementById("fAnchors").textContent = "anchored by " + top3;
+    document.getElementById("finale").classList.add("visible");
+    // Auto-hide after 5s
+    setTimeout(() => document.getElementById("finale").classList.remove("visible"), 6000);
 }}
 
 function stepBack() {{
@@ -817,6 +979,9 @@ function resetGraph() {{
     linkGroup.selectAll("*").remove();
     nodeGroup.selectAll("*").remove();
     labelGroup.selectAll("*").remove();
+    g.selectAll(".pulse-group").remove();
+    document.getElementById("finale").classList.remove("visible");
+    userHasPanned = false;
     updateUI(new Set());
 }}
 
