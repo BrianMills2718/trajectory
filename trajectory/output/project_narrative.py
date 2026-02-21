@@ -3,7 +3,7 @@
 Gathers chronological data, asks an LLM to synthesize a structured narrative (phases,
 key decisions, concept mentions), then renders a scrollytelling HTML page where:
 - Left side: narrative text that fades in paragraph by paragraph
-- Right side: D3 force graph that evolves in sync with scroll position
+- Right side: Mermaid diagram with progressive reveal synced to scroll position
 - Phase transitions shift colors, concept names glow, decisions appear as pull quotes
 """
 
@@ -460,39 +460,11 @@ body {{
     max-width: 100%;
     height: auto;
 }}
-/* Mermaid dark theme overrides */
-#mermaid-diagram .node rect,
-#mermaid-diagram .node circle,
-#mermaid-diagram .node polygon {{
-    transition: opacity 0.4s, filter 0.4s;
-}}
-#mermaid-diagram .cluster rect {{
-    transition: opacity 0.4s;
-}}
-/* Dimmed state for non-active subgraphs */
-#mermaid-diagram.has-focus .node rect,
-#mermaid-diagram.has-focus .node circle,
-#mermaid-diagram.has-focus .node polygon,
-#mermaid-diagram.has-focus .edgePath path,
-#mermaid-diagram.has-focus .edgeLabel,
-#mermaid-diagram.has-focus .cluster rect {{
-    opacity: 0.15;
-}}
-#mermaid-diagram.has-focus .phase-active .node rect,
-#mermaid-diagram.has-focus .phase-active .node circle,
-#mermaid-diagram.has-focus .phase-active .node polygon {{
-    opacity: 1;
-    filter: drop-shadow(0 0 6px rgba(88, 166, 255, 0.4));
-}}
-#mermaid-diagram.has-focus .phase-active .cluster rect {{
-    opacity: 1;
-}}
-/* Edges connected to active subgraph */
-#mermaid-diagram.has-focus .edge-active path {{
-    opacity: 1 !important;
-}}
-#mermaid-diagram.has-focus .edge-active .edgeLabel {{
-    opacity: 1 !important;
+/* Mermaid progressive reveal */
+#mermaid-diagram .cluster,
+#mermaid-diagram .edgePath,
+#mermaid-diagram .edgeLabel {{
+    transition: opacity 0.6s ease, filter 0.6s ease;
 }}
 
 /* --- Phases --- */
@@ -854,76 +826,126 @@ const observer = new IntersectionObserver((entries) => {{
 
 document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
 
-// --- Phase highlighting in diagram ---
-let currentPhase = -1;
+// --- Progressive diagram reveal ---
+let maxRevealedPhase = -1;
+
+// Build node→cluster mapping after render
+function buildClusterMap() {{
+    const diagram = document.getElementById('mermaid-diagram');
+    const clusters = diagram.querySelectorAll('.cluster');
+    const nodeToPhase = {{}};
+
+    clusters.forEach((cluster, idx) => {{
+        // Hide all clusters initially
+        cluster.style.opacity = '0';
+        cluster.setAttribute('data-phase', idx);
+
+        // Map node IDs within this cluster to its phase index
+        cluster.querySelectorAll('.node').forEach(node => {{
+            if (node.id) nodeToPhase[node.id] = idx;
+        }});
+    }});
+
+    // Hide all edges and edge labels initially
+    diagram.querySelectorAll('.edgePath, .edgeLabel').forEach(el => {{
+        el.style.opacity = '0';
+    }});
+
+    return {{ clusters, nodeToPhase }};
+}}
+
+// Determine which phase an edge belongs to (max phase of its endpoints)
+function getEdgePhase(edgeEl, nodeToPhase) {{
+    const id = edgeEl.id || '';
+    let maxPhase = -1;
+    for (const [nodeId, phase] of Object.entries(nodeToPhase)) {{
+        if (id.includes(nodeId)) {{
+            maxPhase = Math.max(maxPhase, phase);
+        }}
+    }}
+    return maxPhase;
+}}
+
+let clusterMap = null;
+
+// Wait for mermaid to finish rendering, then build map
+const waitForRender = setInterval(() => {{
+    const svg = document.querySelector('#mermaid-diagram svg');
+    if (svg) {{
+        clearInterval(waitForRender);
+        clusterMap = buildClusterMap();
+    }}
+}}, 200);
+
+function revealUpToPhase(phaseIdx) {{
+    if (!clusterMap) return;
+    const {{ clusters, nodeToPhase }} = clusterMap;
+    const diagram = document.getElementById('mermaid-diagram');
+
+    clusters.forEach((cluster, idx) => {{
+        if (idx <= phaseIdx) {{
+            // Current phase: full opacity. Previous phases: dimmed.
+            cluster.style.opacity = (idx === phaseIdx) ? '1' : '0.35';
+            cluster.style.filter = (idx === phaseIdx) ? 'none' : 'saturate(0.4)';
+        }} else {{
+            // Future phases: hidden
+            cluster.style.opacity = '0';
+            cluster.style.filter = 'none';
+        }}
+    }});
+
+    // Reveal edges whose endpoints are both visible (phase <= phaseIdx)
+    diagram.querySelectorAll('.edgePath').forEach(edge => {{
+        const edgePhase = getEdgePhase(edge, nodeToPhase);
+        if (edgePhase >= 0 && edgePhase <= phaseIdx) {{
+            edge.style.opacity = (edgePhase === phaseIdx) ? '1' : '0.35';
+        }} else {{
+            edge.style.opacity = '0';
+        }}
+    }});
+    diagram.querySelectorAll('.edgeLabel').forEach(label => {{
+        // Edge labels follow same pattern — match by sibling index
+        const id = label.id || '';
+        let labelPhase = -1;
+        for (const [nodeId, phase] of Object.entries(nodeToPhase)) {{
+            if (id.includes(nodeId)) {{
+                labelPhase = Math.max(labelPhase, phase);
+            }}
+        }}
+        if (labelPhase >= 0 && labelPhase <= phaseIdx) {{
+            label.style.opacity = (labelPhase === phaseIdx) ? '1' : '0.3';
+        }} else {{
+            label.style.opacity = '0';
+        }}
+    }});
+
+    // Scroll diagram to keep active cluster in view
+    if (phaseIdx >= 0 && phaseIdx < clusters.length) {{
+        const rect = clusters[phaseIdx].querySelector('rect');
+        if (rect) {{
+            const y = parseFloat(rect.getAttribute('y') || 0);
+            const container = diagram.parentElement;
+            container.scrollTo({{
+                top: Math.max(0, y - container.clientHeight / 3),
+                behavior: 'smooth'
+            }});
+        }}
+    }}
+}}
 
 const phaseObserver = new IntersectionObserver((entries) => {{
     entries.forEach(entry => {{
         if (entry.isIntersecting) {{
             const phase = parseInt(entry.target.dataset.phase);
-            if (phase !== currentPhase) {{
-                currentPhase = phase;
-                highlightPhase(phase);
+            if (phase > maxRevealedPhase) {{
+                maxRevealedPhase = phase;
             }}
+            revealUpToPhase(phase);
         }}
     }});
 }}, {{ threshold: 0.3 }});
 
 document.querySelectorAll('.phase').forEach(el => phaseObserver.observe(el));
-
-function highlightPhase(phaseIdx) {{
-    const diagram = document.getElementById('mermaid-diagram');
-    const clusters = diagram.querySelectorAll('.cluster');
-
-    if (clusters.length === 0) return;
-
-    // Add focus mode
-    diagram.classList.add('has-focus');
-
-    // Remove previous highlights
-    clusters.forEach(c => c.classList.remove('phase-active'));
-
-    // Highlight current phase cluster
-    if (phaseIdx < clusters.length) {{
-        clusters[phaseIdx].classList.add('phase-active');
-
-        // Scroll diagram to show active cluster
-        const clusterRect = clusters[phaseIdx].getBoundingClientRect();
-        const containerRect = diagram.parentElement.getBoundingClientRect();
-        const scrollTarget = clusters[phaseIdx].querySelector('rect');
-        if (scrollTarget) {{
-            const y = parseFloat(scrollTarget.getAttribute('y') || 0);
-            diagram.parentElement.scrollTo({{
-                top: Math.max(0, y - containerRect.height / 3),
-                behavior: 'smooth'
-            }});
-        }}
-    }}
-
-    // Highlight edges connected to active cluster nodes
-    const activeNodes = new Set();
-    if (phaseIdx < clusters.length) {{
-        clusters[phaseIdx].querySelectorAll('.node').forEach(n => {{
-            const id = n.id;
-            if (id) activeNodes.add(id);
-        }});
-    }}
-
-    // Mark edges as active/inactive
-    diagram.querySelectorAll('.edgePath').forEach(edge => {{
-        edge.classList.remove('edge-active');
-    }});
-    // Mermaid edge IDs contain source and target node references
-    diagram.querySelectorAll('.edgePath').forEach(edge => {{
-        const id = edge.id || '';
-        for (const nodeId of activeNodes) {{
-            if (id.includes(nodeId)) {{
-                edge.classList.add('edge-active');
-                break;
-            }}
-        }}
-    }});
-}}
 </script>
 </body>
 </html>"""
