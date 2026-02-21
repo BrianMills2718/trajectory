@@ -146,22 +146,6 @@ def _gather_narrative_data(db: TrajectoryDB, project_id: int) -> dict:
 
     sessions = db.get_sessions(project_id=project_id, limit=10000)
 
-    # Build co-occurrence edges for the graph
-    edges: list[list[str]] = []
-    for eid, eid_concepts in event_concepts.items():
-        unique = sorted(set(c for c in eid_concepts if mention_counts[c] >= 2))
-        for i in range(len(unique)):
-            for j in range(i + 1, len(unique)):
-                edges.append([unique[i], unique[j]])
-    # Deduplicate
-    edge_set = set()
-    unique_edges = []
-    for e in edges:
-        key = tuple(sorted(e))
-        if key not in edge_set:
-            edge_set.add(key)
-            unique_edges.append(list(key))
-
     return {
         "project_name": project.name,
         "first_date": first_date,
@@ -186,7 +170,6 @@ def _gather_narrative_data(db: TrajectoryDB, project_id: int) -> dict:
         "one_hit_wonders": one_hit_wonders,
         "concept_links": relevant_links,
         "concept_levels": {c: l for c, l in concept_levels.items() if mention_counts[c] >= 2},
-        "graph_edges": unique_edges,
     }
 
 
@@ -268,12 +251,10 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
 
     # Build phase sections HTML
     phase_sections = []
-    all_phase_concepts: list[list[str]] = []  # for the graph: concepts per phase
 
     for i, phase in enumerate(narrative.get("phases", [])):
         color = phase.get("color", "#58a6ff")
         paragraphs_html = []
-        phase_concepts: list[str] = []
 
         for j, para in enumerate(phase.get("paragraphs", [])):
             text = _inline_md(_esc(para.get("text", "")))
@@ -281,7 +262,6 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
             for c in para.get("concepts_active", []):
                 level = data["concept_levels"].get(c, "technique")
                 css_class = f"concept-chip concept-{level}"
-                # Replace underscored name in text (case-insensitive)
                 display = c.replace("_", " ")
                 text = re.sub(
                     re.escape(c),
@@ -292,9 +272,6 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
             paragraphs_html.append(
                 f'<p class="reveal" data-phase="{i}" data-para="{j}">{text}</p>'
             )
-            phase_concepts.extend(para.get("concepts_active", []))
-
-        all_phase_concepts.append(sorted(set(phase_concepts)))
 
         # Key decision pull quote
         decision = phase.get("key_decision", {})
@@ -307,7 +284,6 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
                 <div class="pull-quote-tension">{_esc(decision.get('tension', ''))}</div>
             </div>"""
 
-        # Phase stats
         new_concepts = phase.get("new_concept_count", 0)
         event_count = phase.get("event_count", 0)
 
@@ -332,12 +308,13 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
         f'<span class="ohw-tag">{_esc(c.replace("_", " "))}</span>' for c in ohw[:30]
     )
 
-    # Graph data for D3
-    graph_data = {
-        "concept_levels": data["concept_levels"],
-        "edges": data["graph_edges"],
-        "phase_concepts": all_phase_concepts,
-    }
+    # Mermaid diagram from LLM
+    mermaid_code = narrative.get("diagram", "graph TD\n  A[No diagram generated]")
+    # Escape for embedding in HTML
+    mermaid_json = json.dumps(mermaid_code)
+
+    # Phase names for highlighting
+    phase_names = [p.get("name", f"Phase {i+1}") for i, p in enumerate(narrative.get("phases", []))]
 
     stats = data
 
@@ -467,9 +444,55 @@ body {{
     height: 100vh;
     border-left: 1px solid var(--border);
 }}
-.graph-track svg {{
+.diagram-container {{
     width: 100%;
     height: 100%;
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}}
+#mermaid-diagram {{
+    width: 100%;
+}}
+#mermaid-diagram svg {{
+    max-width: 100%;
+    height: auto;
+}}
+/* Mermaid dark theme overrides */
+#mermaid-diagram .node rect,
+#mermaid-diagram .node circle,
+#mermaid-diagram .node polygon {{
+    transition: opacity 0.4s, filter 0.4s;
+}}
+#mermaid-diagram .cluster rect {{
+    transition: opacity 0.4s;
+}}
+/* Dimmed state for non-active subgraphs */
+#mermaid-diagram.has-focus .node rect,
+#mermaid-diagram.has-focus .node circle,
+#mermaid-diagram.has-focus .node polygon,
+#mermaid-diagram.has-focus .edgePath path,
+#mermaid-diagram.has-focus .edgeLabel,
+#mermaid-diagram.has-focus .cluster rect {{
+    opacity: 0.15;
+}}
+#mermaid-diagram.has-focus .phase-active .node rect,
+#mermaid-diagram.has-focus .phase-active .node circle,
+#mermaid-diagram.has-focus .phase-active .node polygon {{
+    opacity: 1;
+    filter: drop-shadow(0 0 6px rgba(88, 166, 255, 0.4));
+}}
+#mermaid-diagram.has-focus .phase-active .cluster rect {{
+    opacity: 1;
+}}
+/* Edges connected to active subgraph */
+#mermaid-diagram.has-focus .edge-active path {{
+    opacity: 1 !important;
+}}
+#mermaid-diagram.has-focus .edge-active .edgeLabel {{
+    opacity: 1 !important;
 }}
 
 /* --- Phases --- */
@@ -673,20 +696,6 @@ body {{
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
 }}
 
-/* --- Graph nodes --- */
-.node-label {{
-    font-size: 10px;
-    fill: var(--text-dim);
-    font-family: 'SF Mono', 'Fira Code', monospace;
-    pointer-events: none;
-    text-anchor: middle;
-}}
-.node-label.active {{
-    fill: var(--text-bright);
-    font-size: 11px;
-    font-weight: 600;
-}}
-
 /* --- Animations --- */
 @keyframes fadeUp {{
     from {{ opacity: 0; transform: translateY(20px); }}
@@ -695,10 +704,6 @@ body {{
 @keyframes ohwFade {{
     from {{ opacity: 0.3; }}
     to {{ opacity: 0.7; }}
-}}
-@keyframes nodeAppear {{
-    from {{ r: 0; opacity: 0; }}
-    to {{ opacity: 1; }}
 }}
 
 /* --- Responsive --- */
@@ -743,7 +748,9 @@ body {{
         {''.join(phase_sections)}
     </div>
     <div class="graph-track">
-        <svg id="graph"></svg>
+        <div class="diagram-container">
+            <div id="mermaid-diagram"></div>
+        </div>
     </div>
 </div>
 
@@ -762,19 +769,62 @@ body {{
 
 <div class="footer">Generated by trajectory &middot; {datetime.now().strftime('%b %d, %Y')}</div>
 
-<script src="https://d3js.org/d3.v7.min.js"></script>
-<script>
-const GRAPH_DATA = {json.dumps(graph_data)};
-const LEVEL_COLORS = {{
-    theme: '#58a6ff',
-    design_bet: '#d2a8ff',
-    technique: '#7ee787'
-}};
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+const MERMAID_CODE = {mermaid_json};
+const PHASE_NAMES = {json.dumps(phase_names)};
+
+// --- Mermaid init ---
+mermaid.initialize({{
+    startOnLoad: false,
+    theme: 'dark',
+    themeVariables: {{
+        primaryColor: '#1f2937',
+        primaryTextColor: '#e6edf3',
+        primaryBorderColor: '#58a6ff',
+        lineColor: '#8b949e',
+        secondaryColor: '#161b22',
+        tertiaryColor: '#0d1117',
+        background: '#0d1117',
+        mainBkg: '#161b22',
+        nodeBorder: '#58a6ff',
+        clusterBkg: 'rgba(88, 166, 255, 0.06)',
+        clusterBorder: 'rgba(88, 166, 255, 0.2)',
+        titleColor: '#e6edf3',
+        edgeLabelBackground: '#161b22',
+        fontSize: '13px',
+    }},
+    flowchart: {{
+        curve: 'basis',
+        padding: 16,
+        htmlLabels: true,
+        useMaxWidth: true,
+    }},
+}});
+
+async function renderDiagram() {{
+    const container = document.getElementById('mermaid-diagram');
+    try {{
+        const {{ svg }} = await mermaid.render('mermaid-svg', MERMAID_CODE);
+        container.innerHTML = svg;
+
+        // Tag subgraphs with phase indices for highlighting
+        const clusters = container.querySelectorAll('.cluster');
+        clusters.forEach((cluster, idx) => {{
+            cluster.setAttribute('data-phase', idx);
+        }});
+    }} catch (e) {{
+        console.error('Mermaid render error:', e);
+        container.innerHTML = '<pre style="color:#ff7b72;padding:20px;font-size:12px;">' +
+            'Diagram rendering failed.\\n' + e.message + '</pre>';
+    }}
+}}
+renderDiagram();
 
 // --- Counter animation ---
 document.querySelectorAll('.hero-stat .num').forEach(el => {{
     const target = parseInt(el.dataset.count);
-    let current = 0;
     const duration = 1500;
     const start = performance.now();
     function tick(now) {{
@@ -784,7 +834,6 @@ document.querySelectorAll('.hero-stat .num').forEach(el => {{
         el.textContent = Math.round(target * eased);
         if (progress < 1) requestAnimationFrame(tick);
     }}
-    // Start counting when hero is visible (after initial animation)
     setTimeout(() => requestAnimationFrame(tick), 1200);
 }});
 
@@ -793,7 +842,6 @@ const observer = new IntersectionObserver((entries) => {{
     entries.forEach(e => {{
         if (e.isIntersecting) {{
             e.target.classList.add('visible');
-            // Glow concept chips in this element
             e.target.querySelectorAll('.concept-chip').forEach((chip, i) => {{
                 setTimeout(() => {{
                     chip.classList.add('glow');
@@ -806,77 +854,7 @@ const observer = new IntersectionObserver((entries) => {{
 
 document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
 
-// --- D3 Force Graph ---
-const svg = d3.select('#graph');
-const width = svg.node().getBoundingClientRect().width;
-const height = svg.node().getBoundingClientRect().height;
-
-// Build full node/edge sets
-const allConcepts = new Set();
-GRAPH_DATA.phase_concepts.forEach(pc => pc.forEach(c => allConcepts.add(c)));
-// Also include any concepts from edges
-GRAPH_DATA.edges.forEach(e => {{ allConcepts.add(e[0]); allConcepts.add(e[1]); }});
-
-const nodes = Array.from(allConcepts).map(name => ({{
-    id: name,
-    level: GRAPH_DATA.concept_levels[name] || 'technique',
-    active: false,
-    opacity: 0,
-    radius: 0
-}}));
-
-const nodeById = new Map(nodes.map(n => [n.id, n]));
-
-const links = GRAPH_DATA.edges
-    .filter(e => nodeById.has(e[0]) && nodeById.has(e[1]))
-    .map(e => ({{ source: e[0], target: e[1], opacity: 0 }}));
-
-const simulation = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(links).id(d => d.id).distance(60).strength(0.3))
-    .force('charge', d3.forceManyBody().strength(-80))
-    .force('center', d3.forceCenter(width / 2, height / 2))
-    .force('collision', d3.forceCollide().radius(d => d.radius + 4))
-    .alphaDecay(0.02)
-    .on('tick', ticked);
-
-const g = svg.append('g');
-
-const linkElements = g.selectAll('.link')
-    .data(links)
-    .join('line')
-    .attr('class', 'link')
-    .attr('stroke', '#21262d')
-    .attr('stroke-width', 1)
-    .attr('stroke-opacity', 0);
-
-const nodeElements = g.selectAll('.node')
-    .data(nodes)
-    .join('circle')
-    .attr('class', 'node')
-    .attr('r', 0)
-    .attr('fill', d => LEVEL_COLORS[d.level] || '#7ee787')
-    .attr('fill-opacity', 0)
-    .attr('stroke', d => LEVEL_COLORS[d.level] || '#7ee787')
-    .attr('stroke-width', 1.5)
-    .attr('stroke-opacity', 0);
-
-const labelElements = g.selectAll('.node-label')
-    .data(nodes)
-    .join('text')
-    .attr('class', 'node-label')
-    .text(d => d.id.replace(/_/g, ' '))
-    .attr('dy', d => d.radius + 14)
-    .attr('opacity', 0);
-
-function ticked() {{
-    linkElements
-        .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
-        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
-    nodeElements.attr('cx', d => d.x).attr('cy', d => d.y);
-    labelElements.attr('x', d => d.x).attr('y', d => d.y);
-}}
-
-// --- Phase tracking via scroll ---
+// --- Phase highlighting in diagram ---
 let currentPhase = -1;
 
 const phaseObserver = new IntersectionObserver((entries) => {{
@@ -885,7 +863,7 @@ const phaseObserver = new IntersectionObserver((entries) => {{
             const phase = parseInt(entry.target.dataset.phase);
             if (phase !== currentPhase) {{
                 currentPhase = phase;
-                activatePhase(phase);
+                highlightPhase(phase);
             }}
         }}
     }});
@@ -893,71 +871,59 @@ const phaseObserver = new IntersectionObserver((entries) => {{
 
 document.querySelectorAll('.phase').forEach(el => phaseObserver.observe(el));
 
-function activatePhase(phaseIdx) {{
-    // Concepts active up to and including this phase
-    const active = new Set();
-    for (let i = 0; i <= phaseIdx && i < GRAPH_DATA.phase_concepts.length; i++) {{
-        GRAPH_DATA.phase_concepts[i].forEach(c => active.add(c));
+function highlightPhase(phaseIdx) {{
+    const diagram = document.getElementById('mermaid-diagram');
+    const clusters = diagram.querySelectorAll('.cluster');
+
+    if (clusters.length === 0) return;
+
+    // Add focus mode
+    diagram.classList.add('has-focus');
+
+    // Remove previous highlights
+    clusters.forEach(c => c.classList.remove('phase-active'));
+
+    // Highlight current phase cluster
+    if (phaseIdx < clusters.length) {{
+        clusters[phaseIdx].classList.add('phase-active');
+
+        // Scroll diagram to show active cluster
+        const clusterRect = clusters[phaseIdx].getBoundingClientRect();
+        const containerRect = diagram.parentElement.getBoundingClientRect();
+        const scrollTarget = clusters[phaseIdx].querySelector('rect');
+        if (scrollTarget) {{
+            const y = parseFloat(scrollTarget.getAttribute('y') || 0);
+            diagram.parentElement.scrollTo({{
+                top: Math.max(0, y - containerRect.height / 3),
+                behavior: 'smooth'
+            }});
+        }}
     }}
-    // Current phase concepts (for emphasis)
-    const current = new Set(GRAPH_DATA.phase_concepts[phaseIdx] || []);
 
-    // Update nodes
-    nodes.forEach(n => {{
-        const isActive = active.has(n.id);
-        const isCurrent = current.has(n.id);
-        n.active = isActive;
-        n.radius = isCurrent ? 8 : (isActive ? 5 : 0);
-        n.opacity = isCurrent ? 1.0 : (isActive ? 0.5 : 0);
-    }});
-
-    // Animate
-    nodeElements.transition().duration(600)
-        .attr('r', d => d.radius)
-        .attr('fill-opacity', d => d.opacity * 0.4)
-        .attr('stroke-opacity', d => d.opacity);
-
-    labelElements.transition().duration(600)
-        .attr('opacity', d => d.active ? (current.has(d.id) ? 0.9 : 0.3) : 0)
-        .attr('dy', d => d.radius + 14)
-        .classed('active', d => current.has(d.id));
-
-    // Edges: visible if both endpoints active
-    linkElements.transition().duration(600)
-        .attr('stroke-opacity', d => {{
-            const sa = active.has(d.source.id || d.source);
-            const ta = active.has(d.target.id || d.target);
-            if (!sa || !ta) return 0;
-            const sc = current.has(d.source.id || d.source);
-            const tc = current.has(d.target.id || d.target);
-            return (sc && tc) ? 0.4 : 0.12;
-        }})
-        .attr('stroke', d => {{
-            const sc = current.has(d.source.id || d.source);
-            const tc = current.has(d.target.id || d.target);
-            return (sc || tc) ? '#8b949e' : '#21262d';
+    // Highlight edges connected to active cluster nodes
+    const activeNodes = new Set();
+    if (phaseIdx < clusters.length) {{
+        clusters[phaseIdx].querySelectorAll('.node').forEach(n => {{
+            const id = n.id;
+            if (id) activeNodes.add(id);
         }});
-
-    simulation.force('collision').radius(d => d.radius + 4);
-    simulation.alpha(0.3).restart();
-
-    // Update phase color accent on body
-    const phaseEl = document.querySelector(`.phase[data-phase="${{phaseIdx}}"]`);
-    if (phaseEl) {{
-        document.body.style.setProperty('--current-phase-color', phaseEl.dataset.color);
     }}
+
+    // Mark edges as active/inactive
+    diagram.querySelectorAll('.edgePath').forEach(edge => {{
+        edge.classList.remove('edge-active');
+    }});
+    // Mermaid edge IDs contain source and target node references
+    diagram.querySelectorAll('.edgePath').forEach(edge => {{
+        const id = edge.id || '';
+        for (const nodeId of activeNodes) {{
+            if (id.includes(nodeId)) {{
+                edge.classList.add('edge-active');
+                break;
+            }}
+        }}
+    }});
 }}
-
-// Zoom behavior
-const zoom = d3.zoom()
-    .scaleExtent([0.3, 3])
-    .on('zoom', (event) => g.attr('transform', event.transform));
-svg.call(zoom);
-
-// Initial zoom to fit
-setTimeout(() => {{
-    svg.call(zoom.transform, d3.zoomIdentity.translate(width * 0.1, height * 0.1).scale(0.8));
-}}, 100);
 </script>
 </body>
 </html>"""
