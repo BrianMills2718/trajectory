@@ -1290,13 +1290,18 @@ const phaseObserver = new IntersectionObserver((entries) => {{
 
 document.querySelectorAll('.phase-header').forEach(el => phaseObserver.observe(el));
 
-// === CINEMA MODE (autoplay) ===
+// Expose revealUpTo to the cinema script
+window._revealUpTo = revealUpTo;
+window._userPannedRecently = (v) => {{ userPannedRecently = v; }};
+</script>
+
+<!-- Cinema mode — separate script so it works even if D3/dagre CDN fails -->
+<script>
 const TIMELINE = {timeline_json};
-const STEP_DURATION = 4000; // ms per paragraph
-const TYPEWRITER_SPEED = 20; // ms per character
+const TYPEWRITER_SPEED = 20;
 
 let cinemaPlaying = false;
-let cinemaStep = -1; // -1 = hero, 0..N = paragraphs
+let cinemaStep = -1;
 let cinemaTimer = null;
 let typewriterTimer = null;
 
@@ -1305,29 +1310,23 @@ const progressBar = document.getElementById('cinema-progress');
 const dateDisplay = document.getElementById('cinema-date');
 const timeDisplay = document.getElementById('cinema-time');
 
-playBtn.addEventListener('click', () => {{
-    if (cinemaPlaying) {{
-        stopCinema();
-    }} else {{
-        startCinema();
-    }}
+playBtn.addEventListener('click', function() {{
+    if (cinemaPlaying) stopCinema();
+    else startCinema();
 }});
 
 function startCinema() {{
     cinemaPlaying = true;
-    playBtn.textContent = '\\u275A\\u275A Pause';
+    playBtn.textContent = '\u275A\u275A Pause';
     playBtn.classList.add('playing');
-    userPannedRecently = false;
-
-    // If at the end, restart
+    if (window._userPannedRecently) window._userPannedRecently(false);
     if (cinemaStep >= TIMELINE.length - 1) cinemaStep = -1;
-
     advanceCinema();
 }}
 
 function stopCinema() {{
     cinemaPlaying = false;
-    playBtn.textContent = '\\u25B6 Play';
+    playBtn.textContent = '\u25B6 Play';
     playBtn.classList.remove('playing');
     clearTimeout(cinemaTimer);
     clearTimeout(typewriterTimer);
@@ -1338,117 +1337,102 @@ function advanceCinema() {{
     cinemaStep++;
 
     if (cinemaStep === 0) {{
-        // Scroll past hero
         window.scrollTo({{ top: window.innerHeight - 100, behavior: 'smooth' }});
         cinemaTimer = setTimeout(advanceCinema, 1500);
         return;
     }}
 
-    const idx = cinemaStep - 1;
+    var idx = cinemaStep - 1;
     if (idx >= TIMELINE.length) {{
-        // Done — scroll to epitaph
-        const arc = document.querySelector('.arc-section');
+        var arc = document.querySelector('.arc-section');
         if (arc) arc.scrollIntoView({{ behavior: 'smooth' }});
         progressBar.style.width = '100%';
         stopCinema();
         return;
     }}
 
-    const step = TIMELINE[idx];
-    const progress = ((idx + 1) / TIMELINE.length) * 100;
-    progressBar.style.width = progress + '%';
+    var step = TIMELINE[idx];
+    progressBar.style.width = (((idx + 1) / TIMELINE.length) * 100) + '%';
     dateDisplay.textContent = step.date_range;
 
-    // Find the paragraph element
-    const paraEl = document.querySelector(
+    var paraEl = document.querySelector(
         '.reveal[data-phase="' + step.phase + '"][data-para="' + step.step + '"]'
     );
-    // Also reveal the phase header if this is step 0
+
     if (step.step === 0) {{
-        const header = document.querySelector('.phase-header[data-phase="' + step.phase + '"]');
+        var header = document.querySelector('.phase-header[data-phase="' + step.phase + '"]');
         if (header) {{
             header.classList.add('visible');
             header.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
         }}
-        // Brief pause for header
-        cinemaTimer = setTimeout(() => {{
+        cinemaTimer = setTimeout(function() {{
             if (!cinemaPlaying) return;
-            typewriteParagraph(paraEl, step, idx);
+            typewriteParagraph(paraEl, step);
         }}, 800);
         return;
     }}
 
-    typewriteParagraph(paraEl, step, idx);
+    typewriteParagraph(paraEl, step);
 }}
 
-function typewriteParagraph(paraEl, step, idx) {{
-    if (!paraEl || !cinemaPlaying) return;
+function typewriteParagraph(paraEl, step) {{
+    if (!paraEl || !cinemaPlaying) {{ advanceAfterPause(); return; }}
 
-    // Scroll paragraph into view
     paraEl.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
 
-    // Trigger graph reveal
-    revealUpTo(step.phase, step.step);
+    if (window._revealUpTo) window._revealUpTo(step.phase, step.step);
 
-    // Typewriter effect: store original HTML, type it out
-    const fullHTML = paraEl.innerHTML;
-    const fullText = paraEl.textContent;
+    var fullHTML = paraEl.innerHTML;
+    var fullText = paraEl.textContent;
     paraEl.classList.add('visible', 'typewriter');
     paraEl.innerHTML = '<span class="typewriter-cursor"></span>';
 
-    let charIdx = 0;
-    // We type the text content but restore full HTML at the end (for concept chips etc.)
+    var charIdx = 0;
     function typeChar() {{
-        if (!cinemaPlaying) {{
-            paraEl.innerHTML = fullHTML;
-            return;
-        }}
+        if (!cinemaPlaying) {{ paraEl.innerHTML = fullHTML; return; }}
         charIdx++;
         if (charIdx <= fullText.length) {{
             paraEl.innerHTML = fullText.slice(0, charIdx) + '<span class="typewriter-cursor"></span>';
             typewriterTimer = setTimeout(typeChar, TYPEWRITER_SPEED);
         }} else {{
-            // Done typing — restore full HTML with concept chips
             paraEl.innerHTML = fullHTML;
-            paraEl.querySelectorAll('.concept-chip').forEach((chip, i) => {{
-                setTimeout(() => {{
+            paraEl.querySelectorAll('.concept-chip').forEach(function(chip, i) {{
+                setTimeout(function() {{
                     chip.classList.add('glow');
-                    setTimeout(() => chip.classList.remove('glow'), 1200);
+                    setTimeout(function() {{ chip.classList.remove('glow'); }}, 1200);
                 }}, i * 150);
             }});
-            // Pause, then advance
-            cinemaTimer = setTimeout(advanceCinema, 1200);
+            advanceAfterPause();
         }}
     }}
-    // Start typing after scroll settles
     setTimeout(typeChar, 400);
 }}
 
-// Timeline bar click to seek
-document.querySelector('.cinema-timeline').addEventListener('click', (e) => {{
-    const rect = e.currentTarget.getBoundingClientRect();
-    const pct = (e.clientX - rect.left) / rect.width;
-    const targetIdx = Math.floor(pct * TIMELINE.length);
-    cinemaStep = targetIdx; // advanceCinema will increment
+function advanceAfterPause() {{
+    cinemaTimer = setTimeout(advanceCinema, 1200);
+}}
+
+document.querySelector('.cinema-timeline').addEventListener('click', function(e) {{
+    var rect = e.currentTarget.getBoundingClientRect();
+    var pct = (e.clientX - rect.left) / rect.width;
+    cinemaStep = Math.floor(pct * TIMELINE.length);
     if (!cinemaPlaying) startCinema();
     else advanceCinema();
 }});
 
-// Show elapsed time during playback
-let cinemaStartTime = null;
-setInterval(() => {{
+var cinemaStartTime = null;
+setInterval(function() {{
     if (cinemaPlaying) {{
         if (!cinemaStartTime) cinemaStartTime = Date.now();
-        const elapsed = Math.floor((Date.now() - cinemaStartTime) / 1000);
-        const m = Math.floor(elapsed / 60);
-        const s = elapsed % 60;
-        timeDisplay.textContent = m + ':' + String(s).padStart(2, '0');
+        var elapsed = Math.floor((Date.now() - cinemaStartTime) / 1000);
+        var m = Math.floor(elapsed / 60);
+        var s = elapsed % 60;
+        timeDisplay.textContent = m + ':' + (s < 10 ? '0' : '') + s;
     }} else {{
         cinemaStartTime = null;
     }}
 }}, 1000);
 
-// Auto-start if URL has ?autoplay
 if (new URLSearchParams(window.location.search).has('autoplay')) {{
     setTimeout(startCinema, 2000);
 }}
