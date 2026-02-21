@@ -706,6 +706,78 @@ body {{
     stroke-width: 3;
     filter: drop-shadow(0 0 8px rgba(126, 231, 135, 0.4));
 }}
+/* Node popover */
+.node-popover {{
+    position: absolute;
+    z-index: 20;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    max-width: 320px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    pointer-events: auto;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.2s, transform 0.2s;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}}
+.node-popover.visible {{
+    opacity: 1;
+    transform: translateY(0);
+}}
+.node-popover-title {{
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-bright);
+    margin-bottom: 6px;
+}}
+.node-popover-type {{
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 10px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    display: inline-block;
+}}
+.node-popover-type.type-beat {{ background: rgba(88,166,255,0.15); color: var(--blue); }}
+.node-popover-type.type-decision {{ background: rgba(247,129,102,0.15); color: var(--orange); }}
+.node-popover-type.type-dead {{ background: rgba(255,123,114,0.15); color: var(--red); }}
+.node-popover-type.type-win {{ background: rgba(126,231,135,0.15); color: var(--green); }}
+.node-popover-phase {{
+    font-size: 11px;
+    color: var(--text-dimmer);
+    margin-bottom: 10px;
+}}
+.node-popover-connections {{
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.6;
+}}
+.node-popover-connections .edge-in {{
+    color: var(--text-dim);
+}}
+.node-popover-connections .edge-out {{
+    color: var(--text);
+}}
+.node-popover-connections .edge-verb {{
+    color: var(--purple);
+    font-style: italic;
+}}
+.node-popover-close {{
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    background: none;
+    border: none;
+    color: var(--text-dimmer);
+    font-size: 16px;
+    cursor: pointer;
+    line-height: 1;
+}}
+.node-popover-close:hover {{ color: var(--text-dim); }}
+
 /* Node breathing pulse when revealed */
 .graph-node.revealed rect,
 .graph-node.revealed polygon {{
@@ -1192,6 +1264,13 @@ body {{
         </div>
         <div class="diagram-container">
             <svg id="diagram-svg"></svg>
+            <div class="node-popover" id="node-popover">
+                <button class="node-popover-close" id="popover-close">&times;</button>
+                <div class="node-popover-title" id="popover-title"></div>
+                <span class="node-popover-type" id="popover-type"></span>
+                <div class="node-popover-phase" id="popover-phase"></div>
+                <div class="node-popover-connections" id="popover-connections"></div>
+            </div>
         </div>
     </div>
 </div>
@@ -1674,6 +1753,66 @@ GRAPH_DATA.nodes.forEach(n => {{
     }}
 
     addLabel(ng, n.label);
+
+    // Click handler for popover
+    ng.style('cursor', 'pointer');
+    ng.on('click', (event) => {{
+        event.stopPropagation();
+        const popover = document.getElementById('node-popover');
+        const container = document.querySelector('.diagram-container');
+
+        // Build connection info
+        const inEdges = GRAPH_DATA.edges.filter(e => e.to === n.id);
+        const outEdges = GRAPH_DATA.edges.filter(e => e.from === n.id);
+
+        let connectionsHtml = '';
+        if (inEdges.length > 0) {{
+            connectionsHtml += '<div style="margin-bottom:6px"><strong style="color:var(--text-dimmer);font-size:10px;text-transform:uppercase;letter-spacing:1px">Caused by</strong></div>';
+            inEdges.forEach(e => {{
+                const sourceNode = nodeById[e.from];
+                const label = sourceNode ? sourceNode.label : e.from;
+                connectionsHtml += '<div class="edge-in">' + label +
+                    ' <span class="edge-verb">' + (e.label || '→') + '</span> this</div>';
+            }});
+        }}
+        if (outEdges.length > 0) {{
+            connectionsHtml += '<div style="margin-top:8px;margin-bottom:6px"><strong style="color:var(--text-dimmer);font-size:10px;text-transform:uppercase;letter-spacing:1px">Led to</strong></div>';
+            outEdges.forEach(e => {{
+                const targetNode = nodeById[e.to];
+                const label = targetNode ? targetNode.label : e.to;
+                connectionsHtml += '<div class="edge-out">this <span class="edge-verb">' +
+                    (e.label || '→') + '</span> ' + label + '</div>';
+            }});
+        }}
+        if (!inEdges.length && !outEdges.length) {{
+            connectionsHtml = '<div style="color:var(--text-dimmer);font-style:italic">No connections</div>';
+        }}
+
+        document.getElementById('popover-title').textContent = n.label;
+        const typeEl = document.getElementById('popover-type');
+        typeEl.textContent = n.type;
+        typeEl.className = 'node-popover-type type-' + n.type;
+        document.getElementById('popover-phase').textContent =
+            'Phase ' + (n.phase + 1) + ': ' + PHASE_NAMES[n.phase];
+        document.getElementById('popover-connections').innerHTML = connectionsHtml;
+
+        // Position near the clicked node
+        const nodeScreenX = nd.x * zoomLevel - container.scrollLeft;
+        const nodeScreenY = nd.y * zoomLevel - container.scrollTop;
+        popover.style.left = Math.min(nodeScreenX + 20, container.clientWidth - 340) + 'px';
+        popover.style.top = Math.max(10, nodeScreenY - 60) + 'px';
+        popover.classList.add('visible');
+    }});
+}});
+
+// Close popover
+document.getElementById('popover-close').addEventListener('click', () => {{
+    document.getElementById('node-popover').classList.remove('visible');
+}});
+document.querySelector('.diagram-container').addEventListener('click', (e) => {{
+    if (!e.target.closest('.graph-node') && !e.target.closest('.node-popover')) {{
+        document.getElementById('node-popover').classList.remove('visible');
+    }}
 }});
 
 // --- Scroll-triggered reveal ---
