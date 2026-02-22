@@ -129,6 +129,8 @@ Multi-level extraction validated across 3 diverse project types:
 - Project wrapped — DONE (`trajectory/output/project_wrapped.py`). Spotify Wrapped-style insight cards. CLI: `wrapped <project>`
 - Concept evolution — DONE (`trajectory/output/concept_evolution.py`). Animated D3.js force graph with beats, narrative moments, auto-camera. CLI: `evolution <project>`
 - Project narrative — DONE (`trajectory/output/project_narrative.py`). LLM-synthesized story of a project's intellectual journey. Gathers events/concepts/decisions, feeds to LLM via Jinja2 prompt, renders dark-themed HTML. CLI: `narrative <project> [--model ...]`
+- Doc narrative — DONE (`trajectory/output/project_narrative.py`). Analyzes versioned markdown documents (no DB needed). 3-pass pipeline: parse versions → LLM concept extraction → narrative + journey diagram. Handles V-numbered, number-prefixed, and named version headers. CLI: `doc-narrative <path> [--name ...]`
+- Cross-doc narrative — DONE (`trajectory/output/project_narrative.py`). Analyzes concept migration across multiple versioned documents. 5-step pipeline: parse each doc → extract concepts → LLM merge (shared/migrated concepts) → unified narrative → journey diagram. CLI: `cross-doc <paths...> [--name ...]`
 - Code DNA strip (deferred)
 - Concept half-life chart (deferred)
 - See `docs/VISUALIZATION_EXPERIMENTS.md` for full backlog + dependency graph
@@ -144,7 +146,7 @@ trajectory/
 │   ├── models.py                  # All Pydantic models
 │   ├── db.py                      # TrajectoryDB class — SQLite wrapper with all operations
 │   ├── ingest.py                  # Orchestrator: runs extractors, dedup, stores events
-│   ├── cli.py                     # CLI: ingest, analyze, stats, query, extract-tech, extract-patterns, extract-deps, rollup, heatmap, wrapped, evolution, narrative, mural, dataflow
+│   ├── cli.py                     # CLI: ingest, analyze, stats, query, extract-tech, extract-patterns, extract-deps, rollup, heatmap, wrapped, evolution, narrative, doc-narrative, cross-doc, mural, dataflow
 │   ├── mcp_server.py              # MCP server — 8 tools
 │   ├── extractors/
 │   │   ├── base.py                # BaseExtractor ABC
@@ -272,6 +274,14 @@ python -m trajectory.cli narrative agent_ontology --model gemini/gemini-2.5-flas
 # Other visualizations
 python -m trajectory.cli wrapped agent_ontology    # Wrapped-style insight cards
 python -m trajectory.cli evolution agent_ontology  # Animated concept graph
+
+# Document narrative (no DB — analyzes versioned markdown directly)
+python -m trajectory.cli doc-narrative "/path/to/Versioned Doc.md"
+python -m trajectory.cli doc-narrative "/path/to/doc.md" --name my_analysis
+
+# Cross-document concept migration analysis
+python -m trajectory.cli cross-doc "/path/to/doc1.md" "/path/to/doc2.md" "/path/to/doc3.md"
+python -m trajectory.cli cross-doc "/path/to/doc1.md" "/path/to/doc2.md" --name writing_evolution
 
 # Generate AI art mural (themes × months, PCA-positioned)
 python -m trajectory.cli mural --dry-run          # preview layout + prompts

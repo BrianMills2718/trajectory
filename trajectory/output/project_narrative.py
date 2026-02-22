@@ -176,6 +176,174 @@ def _gather_narrative_data(db: TrajectoryDB, project_id: int) -> dict:
     }
 
 
+def _strip_json_fences(raw: str) -> str:
+    """Strip markdown code fences from LLM JSON output."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    return raw
+
+
+def _parse_versioned_doc(doc_path: str | Path) -> list[dict]:
+    """Parse a versioned markdown document into a list of version dicts.
+
+    Handles multiple header formats:
+    - '# V<number>' (CEO Cloning, Elite Cyborg)
+    - '# <number> <text>' or '# <number><text>' (Rewiring Brain)
+    - '# <Named Version>' (e.g. 'Linkedin Version 2')
+
+    Skips fragment sections (notes, aspects, thesis fragments) that aren't
+    full document versions (< 200 words).
+    """
+    doc_path = Path(doc_path)
+    text = doc_path.read_text(encoding="utf-8")
+
+    # Try V-numbered headers first
+    v_pattern = re.compile(r"^# (V\d+.*?)$", re.MULTILINE)
+    v_splits = list(v_pattern.finditer(text))
+
+    # Try number-prefixed headers (e.g. "# 10 short - ..." or "# 5Rewirin...")
+    num_pattern = re.compile(r"^# (\d+\s*.*?)$", re.MULTILINE)
+    num_splits = list(num_pattern.finditer(text))
+
+    # Also catch named versions like "# Linkedin Version 2"
+    named_pattern = re.compile(r"^# ((?:Linkedin|Draft|Final|Version)\s+.*?)$", re.MULTILINE | re.IGNORECASE)
+    named_splits = list(named_pattern.finditer(text))
+
+    # Use whichever pattern found the most matches, combining named with best
+    if len(v_splits) >= len(num_splits):
+        splits = v_splits
+    else:
+        splits = num_splits
+    # Add named splits that don't overlap with primary
+    primary_positions = {m.start() for m in splits}
+    for m in named_splits:
+        if m.start() not in primary_positions:
+            splits.append(m)
+    splits.sort(key=lambda m: m.start())
+
+    if not splits:
+        raise ValueError(f"No version headers found in {doc_path.name}")
+
+    versions = []
+    for i, match in enumerate(splits):
+        header = match.group(1).strip()
+        start = match.end()
+        end = splits[i + 1].start() if i + 1 < len(splits) else len(text)
+        body = text[start:end].strip()
+        word_count = len(body.split())
+
+        # Skip fragments (< 200 words) — these are notes, not full versions
+        if word_count < 200:
+            continue
+
+        # Extract version number
+        vnum_match = re.match(r"V(\d+)", header)
+        if not vnum_match:
+            vnum_match = re.match(r"(\d+)", header)
+        if vnum_match:
+            vnum = int(vnum_match.group(1))
+        else:
+            # Named version — assign high number (latest)
+            vnum = 100 + i
+
+        # Extract editorial note
+        if header.startswith(f"V{vnum}"):
+            note = header[len(f"V{vnum}"):].strip().lstrip("-").strip()
+        elif header.startswith(str(vnum)):
+            note = header[len(str(vnum)):].strip().lstrip("-").strip()
+        else:
+            note = header
+
+        # Section headers
+        sections = re.findall(r"^#{2,4}\s+\*?\*?(.+?)\*?\*?\s*$", body, re.MULTILINE)
+
+        versions.append({
+            "number": vnum,
+            "header": header,
+            "note": note,
+            "body": body,
+            "word_count": word_count,
+            "sections": sections[:8],
+        })
+
+    # Sort by version number (oldest first)
+    versions.sort(key=lambda v: v["number"])
+
+    # Deduplicate: when same version number appears twice, keep the larger one
+    deduped: list[dict] = []
+    for v in versions:
+        if deduped and deduped[-1]["number"] == v["number"]:
+            if v["word_count"] > deduped[-1]["word_count"]:
+                deduped[-1] = v
+        else:
+            deduped.append(v)
+    versions = deduped
+
+    # Compute diffs between consecutive versions
+    for i, v in enumerate(versions):
+        if i == 0:
+            v["added_sections"] = v["sections"][:]
+            v["removed_sections"] = []
+        else:
+            prev = versions[i - 1]
+            prev_set = set(s.lower().strip("* ") for s in prev["sections"])
+            curr_set = set(s.lower().strip("* ") for s in v["sections"])
+            v["added_sections"] = [s for s in v["sections"] if s.lower().strip("* ") not in prev_set]
+            v["removed_sections"] = [s for s in prev["sections"] if s.lower().strip("* ") not in curr_set]
+            v["word_delta"] = v["word_count"] - prev["word_count"]
+
+    return versions
+
+
+def _extract_doc_concepts(
+    versions: list[dict], doc_name: str, model: str,
+) -> tuple[list[dict], dict[str, list[str]]]:
+    """Run LLM concept extraction across document versions.
+
+    Returns (concepts, version_concepts) where:
+    - concepts: list of concept dicts with name, status, description, etc.
+    - version_concepts: mapping of version number str -> list of concept names
+    """
+    concept_prompt = [
+        {"role": "system", "content": """You are analyzing how a document's IDEAS evolve across versions.
+
+For each version, identify 2-5 key concepts/ideas/framings present in that version.
+Track how concepts appear, evolve, merge, split, or get abandoned across versions.
+
+Return a JSON object:
+{
+  "concepts": [
+    {"name": "concept_name", "first_version": 1, "last_version": 31, "status": "survived|evolved|abandoned|merged",
+     "evolved_into": "other_concept_name or null", "description": "What this concept/framing is about"}
+  ],
+  "version_concepts": {
+    "1": ["concept_a", "concept_b"],
+    "5": ["concept_a", "concept_c"]
+  }
+}
+
+Guidelines:
+- Concepts are IDEAS and FRAMINGS, not section headers
+- Track when a concept gets REFRAMED (old concept abandoned, new one born from it)
+- 10-20 total concepts across all versions. Quality over quantity.
+- Use snake_case names that are descriptive"""},
+        {"role": "user", "content": _build_version_content_for_llm(versions)},
+    ]
+    result = call_llm(
+        model, concept_prompt,
+        task="doc_concept_extraction",
+        trace_id=f"trajectory.doc_concepts.{doc_name}",
+        max_budget=0,
+    )
+    data = json.loads(_strip_json_fences(result.content))
+    concepts = data.get("concepts", [])
+    version_concepts = data.get("version_concepts", {})
+    logger.info("Extracted %d concepts from %s across %d versions", len(concepts), doc_name, len(version_concepts))
+    return concepts, version_concepts
+
+
 def _build_version_content_for_llm(versions: list[dict]) -> str:
     """Build a condensed summary of all versions for the concept extraction prompt.
 
@@ -224,53 +392,17 @@ def generate_narrative_from_doc(
 ) -> Path:
     """Generate a narrative from a versioned markdown document (no DB needed).
 
-    Parses version headers (# V1, # V2, etc.) as the timeline, extracts
-    content changes between versions, and feeds into the same two-pass
-    LLM narrative pipeline.
+    Three-pass pipeline:
+    0. Parse versions + LLM concept extraction
+    1. LLM narrative synthesis with concept evolution context
+    2. LLM journey diagram generation
     """
     doc_path = Path(doc_path)
     if not doc_path.exists():
         raise FileNotFoundError(f"Document not found: {doc_path}")
 
     project_name = name or doc_path.stem.replace(" ", "_")
-    text = doc_path.read_text(encoding="utf-8")
-
-    # Parse versions — split on # V<number> headers
-    version_pattern = re.compile(r"^# (V\d+.*?)$", re.MULTILINE)
-    splits = list(version_pattern.finditer(text))
-
-    if not splits:
-        raise ValueError("No version headers found (expected '# V1', '# V2', etc.)")
-
-    versions = []
-    for i, match in enumerate(splits):
-        header = match.group(1).strip()
-        start = match.end()
-        end = splits[i + 1].start() if i + 1 < len(splits) else len(text)
-        body = text[start:end].strip()
-
-        # Extract version number
-        vnum_match = re.match(r"V(\d+)", header)
-        vnum = int(vnum_match.group(1)) if vnum_match else i + 1
-
-        # Extract editorial note from header (e.g. "V28 - V27 refined")
-        note = header[len(f"V{vnum}"):].strip().lstrip("-").lstrip("\\-").strip()
-
-        # Word count and key phrases (first 3 section headers)
-        sections = re.findall(r"^#{2,4}\s+\*?\*?(.+?)\*?\*?\s*$", body, re.MULTILINE)
-        word_count = len(body.split())
-
-        versions.append({
-            "number": vnum,
-            "header": header,
-            "note": note,
-            "body": body,
-            "word_count": word_count,
-            "sections": sections[:8],
-        })
-
-    # Sort by version number (oldest first)
-    versions.sort(key=lambda v: v["number"])
+    versions = _parse_versioned_doc(doc_path)
 
     logger.info(
         "Parsed %d versions from %s (V%d → V%d, %d → %d words)",
@@ -279,62 +411,9 @@ def generate_narrative_from_doc(
         versions[0]["word_count"], versions[-1]["word_count"],
     )
 
-    # --- Pass 0: Extract concepts and diffs across versions ---
-    # Compute what changed between consecutive versions
-    for i, v in enumerate(versions):
-        if i == 0:
-            v["added_sections"] = v["sections"][:]
-            v["removed_sections"] = []
-        else:
-            prev = versions[i - 1]
-            prev_set = set(s.lower().strip("* ") for s in prev["sections"])
-            curr_set = set(s.lower().strip("* ") for s in v["sections"])
-            v["added_sections"] = [s for s in v["sections"] if s.lower().strip("* ") not in prev_set]
-            v["removed_sections"] = [s for s in prev["sections"] if s.lower().strip("* ") not in curr_set]
-            v["word_delta"] = v["word_count"] - prev["word_count"]
-
-    # LLM concept extraction — ask the LLM to identify key concepts per version
+    # --- Pass 0: Concept extraction ---
     logger.info("Extracting concepts across versions...")
-    concept_prompt = [
-        {"role": "system", "content": """You are analyzing how a document's IDEAS evolve across versions.
-
-For each version, identify 2-5 key concepts/ideas/framings present in that version.
-Track how concepts appear, evolve, merge, split, or get abandoned across versions.
-
-Return a JSON object:
-{
-  "concepts": [
-    {"name": "concept_name", "first_version": 1, "last_version": 31, "status": "survived|evolved|abandoned|merged",
-     "evolved_into": "other_concept_name or null", "description": "What this concept/framing is about"}
-  ],
-  "version_concepts": {
-    "1": ["concept_a", "concept_b"],
-    "5": ["concept_a", "concept_c"]
-  }
-}
-
-Guidelines:
-- Concepts are IDEAS and FRAMINGS, not section headers. Examples: "EPA role evolution", "personal data as moat", "CEO cloning metaphor", "attention economy critique"
-- Track when a concept gets REFRAMED (old concept abandoned, new one born from it)
-- 10-20 total concepts across all versions. Quality over quantity.
-- Use snake_case names that are descriptive"""},
-        {"role": "user", "content": _build_version_content_for_llm(versions)},
-    ]
-    concept_result = call_llm(
-        model, concept_prompt,
-        task="doc_concept_extraction",
-        trace_id=f"trajectory.doc_concepts.{project_name}",
-        max_budget=0,
-    )
-    concept_raw = concept_result.content.strip()
-    if concept_raw.startswith("```"):
-        concept_raw = re.sub(r"^```(?:json)?\s*", "", concept_raw)
-        concept_raw = re.sub(r"\s*```$", "", concept_raw)
-    concept_data = json.loads(concept_raw)
-
-    concepts = concept_data.get("concepts", [])
-    version_concepts = concept_data.get("version_concepts", {})
-    logger.info("Extracted %d concepts across %d versions", len(concepts), len(version_concepts))
+    concepts, version_concepts = _extract_doc_concepts(versions, project_name, model)
 
     # Build concept tracking data
     concept_levels: dict[str, str] = {}
@@ -471,11 +550,7 @@ Guidelines:
         max_budget=0,
     )
 
-    raw = result.content.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    narrative = json.loads(raw)
+    narrative = json.loads(_strip_json_fences(result.content))
     logger.info("Narrative: %d phases, cost: $%.4f", len(narrative.get("phases", [])), result.cost or 0)
 
     # Pass 2: Journey diagram
@@ -494,11 +569,7 @@ Guidelines:
         trace_id=f"trajectory.doc_diagram.{project_name}",
         max_budget=0,
     )
-    diagram_raw = diagram_result.content.strip()
-    if diagram_raw.startswith("```"):
-        diagram_raw = re.sub(r"^```(?:json)?\s*", "", diagram_raw)
-        diagram_raw = re.sub(r"\s*```$", "", diagram_raw)
-    graph_data = json.loads(diagram_raw)
+    graph_data = json.loads(_strip_json_fences(diagram_result.content))
     narrative["graph"] = graph_data
     logger.info("Diagram: %d nodes, %d edges", len(graph_data.get("nodes", [])), len(graph_data.get("edges", [])))
 
@@ -507,6 +578,301 @@ Guidelines:
     output_dir = Path(__file__).parent.parent.parent / "data" / "narratives"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{project_name}_narrative.html"
+    output_path.write_text(html, encoding="utf-8")
+
+    logger.info("Output: %s", output_path)
+    return output_path
+
+
+def generate_cross_doc_narrative(
+    doc_paths: list[str | Path],
+    name: str = "cross_doc",
+    model: str = "gemini/gemini-2.5-flash",
+) -> Path:
+    """Generate a unified narrative showing concept migration across multiple documents.
+
+    Pipeline:
+    1. Parse each document independently
+    2. Extract concepts from each document
+    3. LLM merge pass: find shared/migrated concepts across documents
+    4. Unified narrative synthesis
+    5. Journey diagram showing cross-document concept flows
+    """
+    # --- Step 1+2: Parse and extract concepts from each document ---
+    doc_data: list[dict] = []
+    for dp in doc_paths:
+        dp = Path(dp)
+        if not dp.exists():
+            raise FileNotFoundError(f"Document not found: {dp}")
+        doc_name = dp.stem.replace(" ", "_")
+        versions = _parse_versioned_doc(dp)
+        logger.info(
+            "Parsed %s: %d versions (V%d→V%d, %d→%d words)",
+            doc_name, len(versions),
+            versions[0]["number"], versions[-1]["number"],
+            versions[0]["word_count"], versions[-1]["word_count"],
+        )
+        concepts, version_concepts = _extract_doc_concepts(versions, doc_name, model)
+        doc_data.append({
+            "name": doc_name,
+            "path": dp,
+            "versions": versions,
+            "concepts": concepts,
+            "version_concepts": version_concepts,
+        })
+
+    # --- Step 3: Cross-document concept merge ---
+    logger.info("Merging concepts across %d documents...", len(doc_data))
+    merge_input = []
+    for dd in doc_data:
+        merge_input.append(
+            f"## {dd['name']} ({len(dd['versions'])} versions)\n"
+            + "\n".join(
+                f"- {c['name']} ({c.get('status', '?')}): {c.get('description', '')}"
+                for c in dd["concepts"]
+            )
+        )
+
+    merge_prompt = [
+        {"role": "system", "content": """You are analyzing concept migration across multiple related documents by the same author.
+
+These documents were written in parallel or sequentially. Ideas often appear in one document, get refined, and migrate to another.
+
+Your job: identify which concepts are SHARED across documents (same idea, possibly different names) and which concepts MIGRATED (born in one doc, moved to another).
+
+Return a JSON object:
+{
+  "shared_concepts": [
+    {"canonical_name": "name", "description": "what this concept is about",
+     "appearances": [{"doc": "doc_name", "local_name": "concept_name_in_that_doc", "status": "survived|evolved|abandoned"}]}
+  ],
+  "migrations": [
+    {"concept": "name", "from_doc": "doc_name", "to_doc": "doc_name",
+     "description": "How the concept changed when it migrated"}
+  ],
+  "doc_unique_concepts": [
+    {"doc": "doc_name", "concepts": ["concept_a", "concept_b"],
+     "description": "What makes this document's focus distinct"}
+  ]
+}
+
+Guidelines:
+- Be aggressive about matching — same idea with different names IS a shared concept
+- A concept that appears in doc A as "personal_data_moat" and doc B as "data_as_competitive_advantage" is the SAME concept
+- Migrations show intellectual development across documents
+- 5-15 shared concepts, 3-10 migrations. Quality over quantity."""},
+        {"role": "user", "content": "\n\n".join(merge_input)},
+    ]
+
+    merge_result = call_llm(
+        model, merge_prompt,
+        task="cross_doc_concept_merge",
+        trace_id=f"trajectory.cross_doc_merge.{name}",
+        max_budget=0,
+    )
+    merged = json.loads(_strip_json_fences(merge_result.content))
+    shared = merged.get("shared_concepts", [])
+    migrations = merged.get("migrations", [])
+    doc_unique = merged.get("doc_unique_concepts", [])
+    logger.info(
+        "Merged: %d shared concepts, %d migrations, %d doc-unique sets",
+        len(shared), len(migrations), len(doc_unique),
+    )
+
+    # --- Step 4: Build unified data + narrative ---
+    # Build combined concept tracking
+    all_concepts: list[dict] = []
+    concept_levels: dict[str, str] = {}
+    concept_mentions: Counter[str] = Counter()
+
+    for sc in shared:
+        cname = sc["canonical_name"]
+        concept_levels[cname] = "theme"
+        concept_mentions[cname] = len(sc.get("appearances", []))
+        all_concepts.append({
+            "name": cname,
+            "status": "survived",
+            "description": sc.get("description", ""),
+            "cross_doc": True,
+            "doc_count": len(sc.get("appearances", [])),
+        })
+
+    for dd in doc_data:
+        for c in dd["concepts"]:
+            # Skip if already covered by a shared concept
+            is_shared = any(
+                any(a.get("local_name") == c["name"] and a.get("doc") == dd["name"]
+                    for a in sc.get("appearances", []))
+                for sc in shared
+            )
+            if not is_shared:
+                prefixed = f"{dd['name']}:{c['name']}"
+                concept_levels[prefixed] = "technique"
+                concept_mentions[prefixed] = 1
+                all_concepts.append({
+                    "name": prefixed,
+                    "status": c.get("status", "unknown"),
+                    "description": c.get("description", ""),
+                    "cross_doc": False,
+                    "doc_count": 1,
+                })
+
+    # Build timeline "days" — interleave versions from all docs
+    days = []
+    seen_concepts: set[str] = set()
+    for dd in doc_data:
+        for v in dd["versions"]:
+            vnum_str = str(v["number"])
+            v_concepts = dd["version_concepts"].get(vnum_str, [])
+            # Map local concept names to canonical shared names where applicable
+            mapped_concepts = []
+            for vc in v_concepts:
+                canonical = None
+                for sc in shared:
+                    for a in sc.get("appearances", []):
+                        if a.get("local_name") == vc and a.get("doc") == dd["name"]:
+                            canonical = sc["canonical_name"]
+                            break
+                    if canonical:
+                        break
+                mapped_concepts.append(canonical or f"{dd['name']}:{vc}")
+
+            new_concepts = [c for c in mapped_concepts if c not in seen_concepts]
+            seen_concepts.update(mapped_concepts)
+
+            days.append({
+                "date": f"{dd['name']}:V{v['number']}",
+                "event_count": 1,
+                "events": [{
+                    "type": "revision",
+                    "title": f"{dd['name']} V{v['number']}" + (f": {v['note']}" if v['note'] else ""),
+                    "summary": f"{v['word_count']} words",
+                    "concepts": mapped_concepts,
+                }],
+                "decisions": [],
+                "new_concepts": new_concepts,
+            })
+
+    one_hit_wonders = sorted(c for c, n in concept_mentions.items() if n == 1)
+    top_concepts = sorted(all_concepts, key=lambda c: concept_mentions.get(c["name"], 0), reverse=True)
+
+    data = {
+        "project_name": name,
+        "first_date": days[0]["date"] if days else "?",
+        "last_date": days[-1]["date"] if days else "?",
+        "total_days": len(days),
+        "total_events": len(days),
+        "total_concepts": len(all_concepts),
+        "total_decisions": 0,
+        "total_sessions": 0,
+        "top_concepts": [
+            {"name": c["name"], "level": concept_levels.get(c["name"], "theme"),
+             "importance": concept_mentions.get(c["name"], 1),
+             "lifecycle": c.get("status", "unknown"),
+             "first_seen": "cross-doc" if c.get("cross_doc") else "single-doc",
+             "last_seen": f"{c.get('doc_count', 1)} docs"}
+            for c in top_concepts[:30]
+        ],
+        "days": days,
+        "one_hit_wonders": one_hit_wonders,
+        "concept_links": [],
+        "concept_levels": concept_levels,
+    }
+
+    # Build narrative prompt with cross-doc context
+    doc_summaries = []
+    for dd in doc_data:
+        vs = dd["versions"]
+        doc_summaries.append(
+            f"### {dd['name']}\n"
+            + f"{len(vs)} versions, {vs[0]['word_count']}→{vs[-1]['word_count']} words\n"
+            + f"Concepts: {', '.join(c['name'] for c in dd['concepts'][:10])}"
+        )
+
+    messages = [
+        {"role": "system", "content": """You are narrating the intellectual evolution across MULTIPLE related documents by the same author.
+
+These documents share ideas that migrated between them. Tell the story of how the author's thinking evolved ACROSS documents — not document by document, but thematically.
+
+Return a JSON object with this exact structure:
+{
+  "phases": [
+    {
+      "name": "Phase title",
+      "date_range": "Description of what docs/versions this covers",
+      "color": "#58a6ff",
+      "event_count": 5,
+      "new_concept_count": 3,
+      "paragraphs": [
+        {"text": "Narrative paragraph...", "concepts_active": ["concept_name_1", "concept_name_2"]}
+      ],
+      "key_decision": {"title": "Key intellectual shift", "tension": "What was at stake"}
+    }
+  ],
+  "arc_summary": "One paragraph summarizing the full intellectual arc across all documents",
+  "epitaph": "One punchy sentence capturing the author's journey"
+}
+
+Guidelines:
+- 4-7 phases organized THEMATICALLY, not per-document
+- Reference specific documents and version numbers
+- Highlight concept MIGRATIONS: when an idea born in one doc appears in another
+- Show how the author's voice and framing evolved
+- Use the shared concept canonical names (not doc-local names)
+- Phase colors: use visually distinct hex colors"""},
+        {"role": "user", "content": f"# Cross-Document Analysis: {name}\n\n"
+            + f"Documents: {len(doc_data)}\n\n"
+            + "## Documents\n\n" + "\n\n".join(doc_summaries)
+            + "\n\n## Shared concepts (appear in 2+ docs)\n"
+            + "\n".join(
+                f"- **{sc['canonical_name']}**: {sc.get('description', '')} "
+                + f"(in: {', '.join(a['doc'] for a in sc.get('appearances', []))})"
+                for sc in shared)
+            + "\n\n## Migrations\n"
+            + "\n".join(
+                f"- **{m['concept']}**: {m['from_doc']} → {m['to_doc']}: {m.get('description', '')}"
+                for m in migrations)
+            + "\n\n## Document-unique concepts\n"
+            + "\n".join(
+                f"- **{du['doc']}**: {', '.join(du.get('concepts', [])[:5])} — {du.get('description', '')}"
+                for du in doc_unique)},
+    ]
+
+    logger.info("Generating cross-document narrative (%s)...", model)
+    result = call_llm(
+        model, messages,
+        task="cross_doc_narrative",
+        trace_id=f"trajectory.cross_doc_narrative.{name}",
+        max_budget=0,
+    )
+    narrative = json.loads(_strip_json_fences(result.content))
+    logger.info("Narrative: %d phases, cost: $%.4f", len(narrative.get("phases", [])), result.cost or 0)
+
+    # --- Step 5: Journey diagram ---
+    logger.info("Generating cross-document journey diagram...")
+    diagram_messages = render_prompt(
+        PROMPTS_DIR / "narrative_diagram.yaml",
+        project_name=name,
+        phases=narrative.get("phases", []),
+        arc_summary=narrative.get("arc_summary", ""),
+        epitaph=narrative.get("epitaph", ""),
+        top_concepts=data.get("top_concepts", []),
+    )
+    diagram_result = call_llm(
+        model, diagram_messages,
+        task="cross_doc_diagram",
+        trace_id=f"trajectory.cross_doc_diagram.{name}",
+        max_budget=0,
+    )
+    graph_data = json.loads(_strip_json_fences(diagram_result.content))
+    narrative["graph"] = graph_data
+    logger.info("Diagram: %d nodes, %d edges", len(graph_data.get("nodes", [])), len(graph_data.get("edges", [])))
+
+    html = _render_scrollytelling(name, data, narrative)
+
+    output_dir = Path(__file__).parent.parent.parent / "data" / "narratives"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{name}_narrative.html"
     output_path.write_text(html, encoding="utf-8")
 
     logger.info("Output: %s", output_path)

@@ -149,6 +149,13 @@ def main() -> None:
     dn_parser.add_argument("--model", type=str, default=None, help="LLM model")
     dn_parser.add_argument("--video", action="store_true", help="Also record video")
 
+    # cross-doc command — cross-document concept analysis
+    xd_parser = sub.add_parser("cross-doc", help="Cross-document concept migration narrative")
+    xd_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    xd_parser.add_argument("paths", nargs="+", help="Paths to versioned markdown files")
+    xd_parser.add_argument("--name", type=str, default="cross_doc", help="Output name")
+    xd_parser.add_argument("--model", type=str, default=None, help="LLM model")
+
     # supercut command — multi-project video trailer
     sc_parser = sub.add_parser("supercut", help="Generate multi-project narrative supercut video")
     sc_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
@@ -392,6 +399,15 @@ def main() -> None:
             if args.video:
                 video_path = record_video(path, speed=4.0)
                 print(f"Video: {video_path}")
+
+        elif args.command == "cross-doc":
+            from trajectory.output.project_narrative import generate_cross_doc_narrative
+
+            kwargs: dict = {"name": args.name}
+            if args.model:
+                kwargs["model"] = args.model
+            path = generate_cross_doc_narrative(args.paths, **kwargs)
+            print(f"Output: {path}")
 
         elif args.command == "narrative":
             from trajectory.output.project_narrative import generate_narrative
