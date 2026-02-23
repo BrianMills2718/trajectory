@@ -1163,8 +1163,14 @@ def _inline_md(text: str) -> str:
     return text
 
 
-def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> str:
-    """Render the full scrollytelling HTML page."""
+def _render_scrollytelling(
+    project_name: str, data: dict, narrative: dict, *, integrated: bool = False,
+) -> str:
+    """Render the full scrollytelling HTML page.
+
+    Args:
+        integrated: If True, graph fills viewport and text floats over it as cards.
+    """
 
     # Build phase sections HTML
     phase_sections = []
@@ -1174,7 +1180,10 @@ def _render_scrollytelling(project_name: str, data: dict, narrative: dict) -> st
         paragraphs_html = []
 
         for j, para in enumerate(phase.get("paragraphs", [])):
-            text = _inline_md(_esc(para.get("text", "")))
+            raw_text = para.get("text", "")
+            # Strip HTML tags the LLM may have injected (e.g. <mark>, <em>)
+            raw_text = re.sub(r"</?(?:mark|em|strong|b|i|span)[^>]*>", "", raw_text)
+            text = _inline_md(_esc(raw_text))
             # Highlight concept names in text
             for c in para.get("concepts_active", []):
                 level = data["concept_levels"].get(c, "technique")
@@ -1357,7 +1366,7 @@ body {{
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
 }}
 
-/* --- Layout --- */
+/* --- Layout: split mode (default) --- */
 .scrolly-container {{
     display: flex;
     position: relative;
@@ -1379,6 +1388,63 @@ body {{
     overflow: auto;
     position: relative;
     cursor: grab;
+}}
+
+/* --- Layout: integrated mode --- */
+.scrolly-container.integrated {{
+    display: block;
+}}
+.scrolly-container.integrated .graph-track {{
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 1;
+    border-left: none;
+}}
+.scrolly-container.integrated .graph-track .zoom-controls {{
+    position: fixed;
+    top: auto;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: rgba(22, 27, 34, 0.85);
+    backdrop-filter: blur(8px);
+    z-index: 20;
+}}
+.scrolly-container.integrated .diagram-container {{
+    height: 100vh;
+}}
+.scrolly-container.integrated .narrative-track {{
+    position: relative;
+    z-index: 10;
+    width: 44%;
+    max-width: 520px;
+    padding: 100vh 40px 100vh 48px;
+}}
+.scrolly-container.integrated .narrative-track .phase {{
+    background: rgba(13, 17, 23, 0.82);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px 36px;
+    margin-bottom: 80vh;
+}}
+.scrolly-container.integrated .narrative-track .phase:last-child {{
+    margin-bottom: 40vh;
+}}
+.scrolly-container.integrated .narrative-track .phase-header {{
+    margin-bottom: 20px;
+}}
+.scrolly-container.integrated .narrative-track p {{
+    font-size: 16px;
+    line-height: 1.8;
+}}
+.scrolly-container.integrated .pull-quote {{
+    border-radius: 8px;
 }}
 .diagram-container:active {{ cursor: grabbing; }}
 #diagram-svg {{
@@ -1552,6 +1618,20 @@ body {{
     transition: background 0.15s;
 }}
 .zoom-btn:hover {{ background: var(--bg-card); color: var(--text-bright); }}
+/* Fullscreen graph */
+.graph-track.fullscreen {{
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 9999;
+    background: var(--bg);
+    border-left: none;
+}}
+.graph-track.fullscreen .diagram-container {{
+    height: calc(100vh - 48px);
+}}
 .zoom-level {{
     font-size: 11px;
     color: var(--text-dimmer);
@@ -1647,6 +1727,17 @@ body {{
 .concept-chip.glow {{
     box-shadow: 0 0 12px currentColor;
     transform: scale(1.05);
+}}
+.concept-chip.hover-linked {{
+    box-shadow: 0 0 10px currentColor;
+    transform: scale(1.04);
+    transition: all 0.15s;
+}}
+.graph-node.hover-linked rect,
+.graph-node.hover-linked polygon {{
+    filter: drop-shadow(0 0 12px rgba(255, 255, 255, 0.6));
+    stroke-width: 3;
+    transition: all 0.15s;
 }}
 
 /* --- Pull quotes --- */
@@ -1953,7 +2044,7 @@ body {{
 </div>
 
 <!-- Scrollytelling -->
-<div class="scrolly-container">
+<div class="scrolly-container{' integrated' if integrated else ''}">
     <div class="narrative-track">
         {''.join(phase_sections)}
     </div>
@@ -1964,6 +2055,7 @@ body {{
             <button class="zoom-btn" id="zoom-reset" title="Reset zoom">&#x21bb;</button>
             <span class="zoom-level" id="zoom-level">100%</span>
             <span class="phase-indicator" id="phase-indicator"></span>
+            <button class="zoom-btn" id="fullscreen-toggle" title="Toggle fullscreen" style="margin-left:4px">&#x26F6;</button>
         </div>
         <div class="diagram-container">
             <svg id="diagram-svg"></svg>
@@ -2439,6 +2531,7 @@ GRAPH_DATA.nodes.forEach(n => {{
     const ng = nodesG.append('g')
         .attr('class', 'graph-node type-' + n.type)
         .attr('data-id', n.id)
+        .attr('data-concept', n.id)
         .attr('data-phase', n.phase)
         .attr('data-step', n.step)
         .attr('transform', 'translate(' + nd.x + ',' + nd.y + ')')
@@ -2656,6 +2749,27 @@ document.getElementById('zoom-reset').addEventListener('click', () => {{
     zoomLevel = 1; applyZoom();
     document.querySelector('.diagram-container').scrollTo({{ top: 0, left: 0 }});
 }});
+// --- Fullscreen toggle ---
+document.getElementById('fullscreen-toggle').addEventListener('click', () => {{
+    const track = document.querySelector('.graph-track');
+    const btn = document.getElementById('fullscreen-toggle');
+    track.classList.toggle('fullscreen');
+    btn.innerHTML = track.classList.contains('fullscreen') ? '&#x2716;' : '&#x26F6;';
+    btn.title = track.classList.contains('fullscreen') ? 'Exit fullscreen' : 'Toggle fullscreen';
+    // Re-fit graph after layout change
+    setTimeout(() => {{ zoomLevel = 1; applyZoom(); }}, 50);
+}});
+document.addEventListener('keydown', (e) => {{
+    if (e.key === 'Escape') {{
+        const track = document.querySelector('.graph-track');
+        if (track.classList.contains('fullscreen')) {{
+            track.classList.remove('fullscreen');
+            document.getElementById('fullscreen-toggle').innerHTML = '&#x26F6;';
+            document.getElementById('fullscreen-toggle').title = 'Toggle fullscreen';
+        }}
+    }}
+}});
+
 document.querySelector('.diagram-container').addEventListener('wheel', (e) => {{
     if (e.ctrlKey || e.metaKey) {{
         e.preventDefault();
@@ -2753,6 +2867,40 @@ document.querySelectorAll('.phase-header').forEach(el => phaseObserver.observe(e
 // Expose revealUpTo to the cinema script
 window._revealUpTo = revealUpTo;
 window._userPannedRecently = (v) => {{ userPannedRecently = v; }};
+
+// --- Bidirectional hover: text chips ↔ graph nodes ---
+document.addEventListener('mouseover', (e) => {{
+    const chip = e.target.closest('.concept-chip[data-concept]');
+    if (chip) {{
+        const cid = chip.dataset.concept;
+        // Highlight matching graph node
+        document.querySelectorAll('.graph-node[data-concept="' + cid + '"]')
+            .forEach(n => n.classList.add('hover-linked'));
+        // Highlight all matching text chips
+        document.querySelectorAll('.concept-chip[data-concept="' + cid + '"]')
+            .forEach(c => c.classList.add('hover-linked'));
+    }}
+}});
+document.addEventListener('mouseout', (e) => {{
+    const chip = e.target.closest('.concept-chip[data-concept]');
+    if (chip) {{
+        document.querySelectorAll('.hover-linked')
+            .forEach(el => el.classList.remove('hover-linked'));
+    }}
+}});
+// Graph node hover → highlight text chips
+document.querySelectorAll('.graph-node[data-concept]').forEach(node => {{
+    node.addEventListener('mouseenter', () => {{
+        const cid = node.dataset.concept;
+        node.classList.add('hover-linked');
+        document.querySelectorAll('.concept-chip[data-concept="' + cid + '"]')
+            .forEach(c => c.classList.add('hover-linked'));
+    }});
+    node.addEventListener('mouseleave', () => {{
+        document.querySelectorAll('.hover-linked')
+            .forEach(el => el.classList.remove('hover-linked'));
+    }});
+}});
 </script>
 
 <!-- Cinema mode — separate script so it works even if D3/dagre CDN fails -->
