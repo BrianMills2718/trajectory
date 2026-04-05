@@ -4,20 +4,22 @@
 
 Project trajectory tracker — tracks how ideas emerge, evolve, and spread across Brian's 60+ projects. Ingests git commits, Claude Code conversation logs, and documentation into SQLite, then uses LLM analysis to extract concepts, significance scores, decisions, and intent from each event. Exposed as an MCP server for both Claude Code and OpenClaw/moltbot.
 
-## Current State (2026-02-19)
+## Current State (2026-04-04)
+
+Core delivery through Phase 3 is complete: Phase 1 ingestion/storage, Phase 2 LLM analysis, and Phase 3 query + MCP access are all shipped. Current work is post-core expansion: cross-project concept linking, deterministic rollups, and Phase 4 visualization/output experiments.
 
 ### What's Built and Working (Phase 1 + Phase 2 + Phase 3)
 
 **Phase 1: Extractors + SQLite** — COMPLETE
 - `trajectory/config.py` + `config.yaml` — Pydantic config loaded from YAML
 - `trajectory/models.py` — All Pydantic models (EventType, Intent, ConceptStatus, QueryResult, WorkSessionRow, etc.)
-- `trajectory/db.py` — SQLite with WAL mode, full schema (11 tables), all CRUD + query + correction + session operations
+- `trajectory/db.py` — SQLite with WAL mode, full schema (15 tables), all CRUD + query + correction + session operations
 - `trajectory/extractors/git_extractor.py` — PyDriller-based commit extraction with diff summaries and change types
 - `trajectory/extractors/claude_log_extractor.py` — JSONL parser with enriched extraction (commit hashes, files modified/examined, tool sequence, assistant reasoning). Scans both project-specific AND catch-all parent log directories
 - `trajectory/extractors/doc_extractor.py` — Extracts from CLAUDE.md, STATUS.md, archive dirs, docs/archive dirs
 - `trajectory/extractors/session_builder.py` — Links conversations to commits via hash matching, groups orphan commits by day
 - `trajectory/ingest.py` — Orchestrator that runs all 3 extractors with dedup by source_id, supports `--backfill`
-- `trajectory/cli.py` — CLI with `ingest`, `analyze`, `build-sessions`, `stats`, `query`, `link` commands
+- `trajectory/cli.py` — CLI with ingest, analysis, session-building, query, linking, deterministic extractor, and visualization commands
 
 **Phase 2: LLM Analysis** — COMPLETE
 - `trajectory/analysis/event_classifier.py` — Two-phase: session-level analysis first (richer context), then remaining orphan events. Prompts loaded from YAML templates via `render_prompt()`
@@ -119,21 +121,12 @@ Multi-level extraction validated across 3 diverse project types:
 - CLI: `dataflow <project>` subcommand.
 - See `docs/VISUALIZATION_EXPERIMENTS.md` for full experiment tracking and backlog.
 
-### What's NOT Built Yet
+### Next Steps / Deferred Work
 
-**Phase 3 Remaining:**
-- Digest generation for daily/weekly summaries (deferred)
-
-**Phase 4 Visualization Spikes (next):**
-- Concept heatmap grid — DONE (`trajectory/output/concept_heatmap.py`). Auto-granularity, per-level color ramps, interactive HTML mode. CLI: `heatmap <project> [--max-concepts 40] [--html]`
-- Project wrapped — DONE (`trajectory/output/project_wrapped.py`). Spotify Wrapped-style insight cards. CLI: `wrapped <project>`
-- Concept evolution — DONE (`trajectory/output/concept_evolution.py`). Animated D3.js force graph with beats, narrative moments, auto-camera. CLI: `evolution <project>`
-- Project narrative — DONE (`trajectory/output/project_narrative.py`). LLM-synthesized story of a project's intellectual journey. Gathers events/concepts/decisions, feeds to LLM via Jinja2 prompt, renders dark-themed HTML. CLI: `narrative <project> [--model ...]`
-- Doc narrative — DONE (`trajectory/output/project_narrative.py`). Analyzes versioned markdown documents (no DB needed). 3-pass pipeline: parse versions → LLM concept extraction → narrative + journey diagram. Handles V-numbered, number-prefixed, and named version headers. CLI: `doc-narrative <path> [--name ...]`
-- Cross-doc narrative — DONE (`trajectory/output/project_narrative.py`). Analyzes concept migration across multiple versioned documents. 5-step pipeline: parse each doc → extract concepts → LLM merge (shared/migrated concepts) → unified narrative → journey diagram. CLI: `cross-doc <paths...> [--name ...]`
-- Code DNA strip (deferred)
-- Concept half-life chart (deferred)
-- See `docs/VISUALIZATION_EXPERIMENTS.md` for full backlog + dependency graph
+- Digest generation for daily/weekly summaries is still deferred, but it is no longer a blocker for Phase 3 completion.
+- Phase 4 remains the active roadmap area: mural/dataflow visualization polish plus follow-on visual outputs tracked in `docs/VISUALIZATION_EXPERIMENTS.md`.
+- Completed visualization outputs already shipped: concept heatmap, project wrapped, concept evolution, project narrative, doc narrative, and cross-doc narrative.
+- Deferred visualization backlog: Code DNA strip and concept half-life chart.
 
 ## Architecture
 
@@ -337,4 +330,3 @@ This repo uses worktree-based isolation for concurrent AI instances.
 
 **Check for messages from other instances:**
 `python scripts/meta/worktree-coordination/check_messages.py`
-
