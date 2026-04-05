@@ -330,3 +330,44 @@ This repo uses worktree-based isolation for concurrent AI instances.
 
 **Check for messages from other instances:**
 `python scripts/meta/worktree-coordination/check_messages.py`
+
+## Commands
+
+```bash
+# Ingest data (git commits, Claude logs, docs)
+python -m trajectory.cli ingest
+
+# Run LLM analysis
+python -m trajectory.cli analyze
+
+# Query concepts
+python -m trajectory.cli query "search query"
+
+# Start MCP server
+python trajectory_mcp_server.py
+
+# Build sessions
+python -m trajectory.cli sessions
+```
+
+## Principles
+
+- Fail loud: all LLM calls use structured Pydantic output; validation errors surface, not silence
+- Observability: `analysis_runs` table tracks every LLM call (model, prompt version, cost, provenance)
+- Budget-aware: cost caps on analysis runs enforced by config
+- Schema-first: 15-table SQLite schema defined in `trajectory/db.py`
+
+## Workflow
+
+1. Ingest: `python -m trajectory.cli ingest` (git + Claude logs + docs → SQLite)
+2. Analyze: `python -m trajectory.cli analyze` (LLM extracts concepts/decisions)
+3. Query: `python -m trajectory.cli query "..."` (semantic concept search)
+4. Access via MCP server for Claude Code / OpenClaw integration
+
+## References
+
+- `CLAUDE.md` — This file (canonical operating guidance)
+- `AGENTS.md` — Generated mirror for non-Claude agents
+- `config.yaml` — Configuration (DB path, LLM model, cost limits)
+- `docs/` — Design docs and plans
+- `trajectory/models.py` — All Pydantic models
