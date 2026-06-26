@@ -1,0 +1,15 @@
+---
+doc-role: wiki-manifest
+freshness: 2026-06-25
+---
+
+# Wiki Manifest — Trajectory Tracker
+
+id: trajectory
+portfolio_tier: personal
+description: >
+  Trajectory Tracker
+
+sources:
+  - path: ../CLAUDE.md
+    role: instructions
