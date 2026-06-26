@@ -9,7 +9,6 @@ from llm_client import call_llm, render_prompt
 
 from trajectory.config import Config
 from trajectory.db import TrajectoryDB
-from trajectory.ingest import ingest_project
 from trajectory.models import QueryResult
 
 logger = logging.getLogger(__name__)
@@ -381,6 +380,7 @@ def ingest_project_from_path(
     if not path.exists():
         raise FileNotFoundError(f"Project path does not exist: {project_path}")
 
+    from trajectory.ingest import ingest_project  # noqa: PLC0415
     result = ingest_project(path, db, config)
     return {
         "project": path.name,
