@@ -48,6 +48,13 @@ class MuralConfig(BaseModel):
     max_months: int = 4
 
 
+class BridgeConfig(BaseModel):
+    session_significance_threshold: float = 0.7
+    concept_importance_threshold: float = 80.0
+    max_sessions_per_run: int = 50
+    max_concepts_per_run: int = 20
+
+
 class Config(BaseModel):
     db_path: str = "data/trajectory.db"
     projects_dir: str = "/home/brian/projects"
@@ -56,6 +63,7 @@ class Config(BaseModel):
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     digest: DigestConfig = Field(default_factory=DigestConfig)
     mural: MuralConfig = Field(default_factory=MuralConfig)
+    bridge: BridgeConfig = Field(default_factory=BridgeConfig)
 
     @property
     def resolved_db_path(self) -> Path:

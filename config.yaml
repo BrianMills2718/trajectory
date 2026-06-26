@@ -41,6 +41,13 @@ digest:
   daily_max_events: 50
   weekly_max_events: 200
 
+# Agent memory bridge settings
+bridge:
+  session_significance_threshold: 0.7
+  concept_importance_threshold: 80.0
+  max_sessions_per_run: 50
+  max_concepts_per_run: 20
+
 # Mural visualization (Phase 4)
 # X=time (months), Y=conceptual space (themes positioned by PCA of sub-concepts)
 mural:

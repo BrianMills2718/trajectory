@@ -669,6 +669,80 @@ class TrajectoryDB:
         ).fetchall()
         return [WorkSessionRow(**dict(r)) for r in rows]
 
+    def get_sessions_for_bridge(
+        self,
+        min_significance: float = 0.7,
+        since_date: str | None = None,
+        project_filter: str | None = None,
+    ) -> list[dict]:
+        """Return sessions above significance threshold for agent_memory bridging.
+
+        Each dict has: source_id, project, user_goal, avg_significance,
+        timestamp, decisions (list[str]), concepts (list[str]).
+        """
+        query = """
+            SELECT
+                ws.id,
+                e.source_id,
+                p.name AS project,
+                ws.user_goal,
+                ws.significance,
+                ws.session_start
+            FROM work_sessions ws
+            JOIN projects p ON ws.project_id = p.id
+            LEFT JOIN events e ON ws.conversation_event_id = e.id
+            WHERE ws.significance >= ?
+        """
+        params: list = [min_significance]
+
+        if since_date:
+            query += " AND ws.session_start >= ?"
+            params.append(since_date)
+
+        if project_filter:
+            query += " AND p.name = ?"
+            params.append(project_filter)
+
+        query += " ORDER BY ws.significance DESC"
+
+        rows = self.conn.execute(query, params).fetchall()
+
+        result = []
+        for row in rows:
+            session_id = row["id"]
+            source_id = row["source_id"] or f"ws:{session_id}"
+
+            decisions_rows = self.conn.execute(
+                """SELECT DISTINCT d.title FROM decisions d
+                   JOIN session_events se ON d.event_id = se.event_id
+                   WHERE se.session_id = ?
+                   ORDER BY d.id LIMIT 5""",
+                (session_id,),
+            ).fetchall()
+            decisions = [r["title"] for r in decisions_rows if r["title"]]
+
+            concept_rows = self.conn.execute(
+                """SELECT DISTINCT c.name FROM concepts c
+                   JOIN concept_events ce ON c.id = ce.concept_id
+                   JOIN session_events se ON ce.event_id = se.event_id
+                   WHERE se.session_id = ?
+                   LIMIT 10""",
+                (session_id,),
+            ).fetchall()
+            concepts = [r["name"] for r in concept_rows if r["name"]]
+
+            result.append({
+                "source_id": source_id,
+                "project": row["project"],
+                "user_goal": row["user_goal"] or "(no goal recorded)",
+                "avg_significance": row["significance"] or 0.0,
+                "timestamp": row["session_start"] or "",
+                "decisions": decisions,
+                "concepts": concepts,
+            })
+
+        return result
+
     def update_session_analysis(
         self,
         session_id: int,

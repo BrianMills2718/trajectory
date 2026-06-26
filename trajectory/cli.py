@@ -5,12 +5,10 @@ import logging
 import sys
 from pathlib import Path
 
-from trajectory.analysis.concept_linker import link_concepts
 from trajectory.analysis.event_classifier import analyze_project
 from trajectory.config import load_config
 from trajectory.db import TrajectoryDB
 from trajectory.extractors.session_builder import build_sessions
-from trajectory.ingest import ingest_all_projects, ingest_project
 
 
 def main() -> None:
@@ -172,6 +170,14 @@ def main() -> None:
         help="Playback speed for video recording (default: 4x)",
     )
 
+    # sync-memory command — bridge to agent_memory
+    sync_parser = sub.add_parser("sync-memory", help="Sync high-significance sessions to agent_memory")
+    sync_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    sync_parser.add_argument("--since", default=None, help="Only sync sessions since YYYY-MM-DD")
+    sync_parser.add_argument("--project", dest="project_filter", default=None, help="Only sync sessions from this project")
+    sync_parser.add_argument("--dry-run", action="store_true", help="Print what would be synced without writing")
+    sync_parser.add_argument("--threshold", type=float, default=None, help="Minimum significance score (default: from config)")
+
     # dataflow command — single-project dataflow mural
     df_parser = sub.add_parser("dataflow", help="Generate single-project dataflow mural")
     df_parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
@@ -194,6 +200,7 @@ def main() -> None:
 
     try:
         if args.command == "ingest":
+            from trajectory.ingest import ingest_all_projects, ingest_project  # noqa: PLC0415
             if args.project_path:
                 result = ingest_project(
                     Path(args.project_path), db, config, backfill=args.backfill,
@@ -237,6 +244,7 @@ def main() -> None:
             print(result)
 
         elif args.command == "link":
+            from trajectory.analysis.concept_linker import link_concepts  # noqa: PLC0415
             result = link_concepts(db, config)
             print(result)
             # Print links
@@ -475,6 +483,35 @@ def main() -> None:
             )
             if not args.dry_run:
                 print(f"Output: {result.output_dir}")
+
+        elif args.command == "sync-memory":
+            from trajectory.analysis.agent_memory_bridge import AgentMemoryBridge
+
+            threshold = args.threshold if args.threshold is not None else config.bridge.session_significance_threshold
+            state_db_path = config.resolved_db_path.parent / "bridge_state.db"
+            bridge = AgentMemoryBridge(state_db_path)
+
+            sessions = db.get_sessions_for_bridge(
+                min_significance=threshold,
+                since_date=args.since,
+                project_filter=args.project_filter,
+            )
+
+            if not sessions:
+                print("0 sessions to sync. Run `make analyze` first to generate session analysis.")
+            else:
+                max_sessions = config.bridge.max_sessions_per_run
+                if len(sessions) > max_sessions:
+                    print(f"WARNING: {len(sessions)} sessions above threshold, only syncing top {max_sessions}. Run again to continue.")
+
+                summary = bridge.sync_all(sessions, max_sessions=max_sessions, dry_run=args.dry_run)
+
+                prefix = "[dry-run] " if args.dry_run else ""
+                print(f"{prefix}Written: {summary.written}, Skipped: {summary.skipped}, Failed: {summary.failed}")
+                if summary.errors:
+                    for err in summary.errors:
+                        print(f"  ERROR: {err}", file=sys.stderr)
+                    raise SystemExit(1)
 
         else:
             parser.print_help()

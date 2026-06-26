@@ -307,3 +307,10 @@ help-meta:  ## Show meta-process targets
 	@echo "  Plans:"
 	@echo "    plan-tests      Check plan tests (PLAN=N)"
 	@echo "    plan-complete   Complete plan (PLAN=N)"
+
+# === TRAJECTORY TARGETS ===
+
+.PHONY: sync-memory
+
+sync-memory:  ## Sync high-significance sessions to agent_memory
+	python -m trajectory.cli sync-memory
